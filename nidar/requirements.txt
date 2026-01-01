@@ -1,0 +1,3 @@
+git+https://github.com/dronekit/dronekit-python.git@master
+pymavlink>=2.4.8
+future>=0.18.0
