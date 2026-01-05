@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Drone Command Receiver via LoRa/3DR Radio
+Drone Command Receiver via LoRa/3DR Radio (BASIC VERSION)
+
+NOTE: For human detection and autonomous scouting missions, use main.py instead!
+      main.py has DETECT:START, MISSION:START, and human detection features.
+      This file (rx_commands.py) is for basic manual flight control only.
 
 Listens for commands from another laptop via 3DR radio and executes them on the Pixhawk.
 INTEGRATED with nidar/ modules for safety checks and proper logging.
@@ -28,6 +32,9 @@ Usage:
     python3 rx_commands.py
     python3 rx_commands.py --pixhawk /dev/ttyACM0 --radio /dev/ttyUSB0
     python3 rx_commands.py --skip-preflight  # Skip preflight checks (bench test)
+    
+    FOR SCOUTING WITH HUMAN DETECTION, USE:
+    python3 main.py
 """
 
 import sys
@@ -237,11 +244,6 @@ class DroneCommandReceiver:
             self.log("info", "Running preflight checks before arming...")
             self.send_response("Running preflight checks...")
             
-            # Check battery
-            if not self.preflight.check_battery(min_voltage=10.5):
-                self.send_response("ARM FAILED: Battery too low")
-                return
-            
             # Check GPS (optional - warn but continue)
             gps = self.vehicle.gps_0
             if gps and gps.fix_type < 3:
@@ -363,7 +365,7 @@ class DroneCommandReceiver:
         
         # Battery check
         bat_ok = self.preflight.check_battery(min_voltage=10.5)
-        bat_v = self.vehicle.battery.voltage or 0
+        bat_v = self.vehicle.battery.voltage if self.vehicle.battery else 0
         
         # GPS check
         gps = self.vehicle.gps_0
@@ -440,7 +442,7 @@ class DroneCommandReceiver:
         mode = self.vehicle.mode.name
         armed = "ARM" if self.vehicle.armed else "DISARM"
         alt = self.vehicle.location.global_relative_frame.alt or 0
-        bat = self.vehicle.battery.voltage or 0
+        bat = self.vehicle.battery.voltage if self.vehicle.battery else 0
         gps = self.vehicle.gps_0.fix_type if self.vehicle.gps_0 else 0
         
         status = f"STATUS: {mode},{armed},ALT={alt:.1f}m,BAT={bat:.1f}V,GPS={gps}"

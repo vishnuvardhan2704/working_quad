@@ -4,6 +4,8 @@
 Production-quality autonomous waypoint navigation for ArduCopter using ArduPilot SITL simulation and real Pixhawk hardware.
 
 ---
+sudo journalctl -u lora -n 50 --no-pager
+sudo journalctl -u lora -f
 
 ## 🎯 Project Overview
 
@@ -457,6 +459,86 @@ python3 mission_control.py --connect /dev/ttyACM0
 5. **Full Mission:** Run complete 3-waypoint mission
 
 **Always have RC transmitter ready to switch to manual mode!**
+
+---
+
+## 📡 Real-Time Telemetry Logging
+
+The system includes comprehensive telemetry logging that sends all important events to your ground station (QGroundControl) in real-time.
+
+### What's Logged to Ground Station
+
+- **Pre-arm checks**: GPS, EKF, battery, compass status
+- **Failsafe events**: Battery low/critical, GPS loss, GCS timeout
+- **System status**: Mode changes, arm/disarm events
+- **Sensor health**: Accelerometer, gyro, magnetometer issues
+- **Battery monitoring**: Voltage drops, low voltage warnings
+- **GPS status**: Fix type changes, satellite count
+- **Flight controller messages**: All STATUSTEXT from ArduPilot
+
+### Viewing Logs in QGroundControl
+
+1. Open QGroundControl
+2. Connect to your vehicle
+3. Click the **speech bubble icon** (Messages) in the top toolbar
+4. All telemetry logs appear here in real-time
+
+### Using Telemetry with Mission Control
+
+Telemetry is **enabled by default**. All mission logs are sent to the ground station:
+
+```bash
+# Normal run with telemetry (default)
+python3 mission_control.py --connect /dev/ttyUSB0
+
+# Disable telemetry if needed
+python3 mission_control.py --connect /dev/ttyUSB0 --no-telemetry
+```
+
+### Standalone Telemetry Monitor
+
+For continuous monitoring without running a mission, use the dedicated telemetry monitor:
+
+```bash
+# Monitor via USB
+python3 telemetry_monitor.py --connect /dev/ttyACM0
+
+# Monitor via telemetry radio
+python3 telemetry_monitor.py --connect /dev/ttyUSB0
+
+# SITL monitoring
+python3 telemetry_monitor.py --connect udp:127.0.0.1:14551
+
+# Custom status report interval (default 10 seconds)
+python3 telemetry_monitor.py --connect /dev/ttyUSB0 --interval 5
+```
+
+### Telemetry Message Severity Levels
+
+Messages in QGC are color-coded by severity:
+
+| Level | Color | Description |
+|-------|-------|-------------|
+| EMERGENCY | Red | System unusable |
+| ALERT | Red | Immediate action required |
+| CRITICAL | Red | Critical failure |
+| ERROR | Orange | Error conditions |
+| WARNING | Yellow | Warning conditions |
+| NOTICE | Blue | Significant events (mode changes, arm) |
+| INFO | White | Informational |
+| DEBUG | Gray | Debug messages |
+
+### Telemetry Files Structure
+
+```
+utils/
+├── logger.py              # Console logging (now with telemetry forwarding)
+└── telemetry_logger.py    # MAVLink telemetry system
+    ├── TelemetryLogger      # Sends STATUSTEXT messages
+    ├── VehicleStatusMonitor # Continuous status monitoring
+    ├── PrearmCheckReporter  # Pre-arm check reporting
+    └── FailsafeMonitor      # Failsafe configuration/events
+```
 
 ---
 
