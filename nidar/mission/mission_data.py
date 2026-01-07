@@ -1,8 +1,10 @@
 """
 Mission waypoint definitions.
 Define your autonomous flight path here.
+Supports both static waypoints and KML-based area surveys.
 """
 
+import os
 from dronekit import LocationGlobalRelative
 
 
@@ -15,10 +17,20 @@ class MissionData:
     # Default airspeed (m/s)
     DEFAULT_AIRSPEED = 5.0
     
+    # Mission source: "static" for hardcoded waypoints, "kml" for KML file
+    MISSION_SOURCE = os.getenv('MISSION_SOURCE', 'static')
+    
+    # KML file configuration (only used if MISSION_SOURCE="kml")
+    KML_FILE = os.getenv('KML_FILE', 'missions/survey_area.kml')
+    KML_ALTITUDE = float(os.getenv('KML_ALTITUDE', '15.0'))
+    KML_PATTERN = os.getenv('KML_PATTERN', 'curved')  # "curved" or "lawnmower"
+    KML_CAMERA_FOV = float(os.getenv('KML_CAMERA_FOV', '57'))  # degrees
+    KML_OVERLAP = float(os.getenv('KML_OVERLAP', '0.25'))  # 25% overlap
+    
     @staticmethod
-    def get_waypoints():
+    def get_static_waypoints():
         """
-        Returns list of mission waypoints.
+        Returns hardcoded static waypoints.
         
         Each waypoint is a LocationGlobalRelative object:
         - latitude (degrees)
@@ -60,7 +72,38 @@ class MissionData:
         return waypoints
     
     @staticmethod
+    def get_waypoints():
+        """
+        Returns mission waypoints based on MISSION_SOURCE configuration.
+        
+        Returns:
+            List of LocationGlobalRelative waypoints
+            
+        Raises:
+            ValueError: If KML file is invalid or MISSION_SOURCE is unknown
+            FileNotFoundError: If KML file doesn't exist
+        """
+        if MissionData.MISSION_SOURCE == 'kml':
+            # Load waypoints from KML file
+            from .kml_loader import load_waypoints_from_kml
+            return load_waypoints_from_kml(
+                kml_file=MissionData.KML_FILE,
+                altitude_meters=MissionData.KML_ALTITUDE,
+                pattern=MissionData.KML_PATTERN,
+                camera_fov=MissionData.KML_CAMERA_FOV,
+                overlap=MissionData.KML_OVERLAP
+            )
+        else:
+            # Use static waypoints
+            return MissionData.get_static_waypoints()
+    
+    @staticmethod
     def get_mission_summary():
         """Returns human-readable mission summary."""
-        waypoints = MissionData.get_waypoints()
-        return f"Mission: {len(waypoints)} waypoints at {MissionData.TAKEOFF_ALTITUDE}m altitude"
+        if MissionData.MISSION_SOURCE == 'kml':
+            from .kml_loader import get_kml_mission_summary
+            waypoints = MissionData.get_waypoints()
+            return get_kml_mission_summary(waypoints, MissionData.KML_FILE)
+        else:
+            waypoints = MissionData.get_waypoints()
+            return f"Static Mission: {len(waypoints)} waypoints at {MissionData.TAKEOFF_ALTITUDE}m altitude"

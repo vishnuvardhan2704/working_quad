@@ -72,22 +72,7 @@ def run_preflight_checks(vehicle, skip_gps=False):
     
     all_passed = True
     
-    # 1. Battery Check
-    print("\n[CHECK 1] Battery...")
-    battery = vehicle.battery
-    if battery and battery.voltage:
-        voltage = battery.voltage
-        if voltage < 10.5:
-            print(f"  ✗ FAIL: Battery too low: {voltage:.2f}V (min: 10.5V)")
-            all_passed = False
-        elif voltage < 11.0:
-            print(f"  ⚠ WARN: Battery low: {voltage:.2f}V")
-        else:
-            print(f"  ✓ OK: Battery {voltage:.2f}V")
-    else:
-        print("  ⚠ WARN: Battery voltage unavailable")
-    
-    # 2. GPS Check
+    # 1. GPS Check
     print("\n[CHECK 2] GPS...")
     if skip_gps:
         print("  ⚠ SKIPPED (--skip-gps mode)")

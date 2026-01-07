@@ -3,7 +3,15 @@
 
 Production-quality autonomous waypoint navigation for ArduCopter using ArduPilot SITL simulation and real Pixhawk hardware.
 
+
+sudo systemctl start lora
 ---
+sudo journalctl -u lora -n 50 --no-pager
+sudo journalctl -u lora -f
+
+sudo systemctl restart lora
+sudo systemctl status lora --no-pager
+sudo journalctl -u lora -f
 
 ## 🎯 Project Overview
 
@@ -157,6 +165,58 @@ pip install -r requirements.txt
 - `dronekit` (from GitHub master - Python 3.12 compatible)
 - `pymavlink` (MAVLink protocol library)
 - `future` (Python 2/3 compatibility)
+
+---
+
+## ⚙️ Configuration Guide
+
+### Scout Altitude (Scouting Missions)
+
+The default altitude for all scouting missions (both waypoint-based and KML-based) is **5 meters AGL** (Above Ground Level).
+
+#### **How to Change Scout Altitude**
+
+**Option 1: Edit Global Constant (Permanent)**
+
+Edit `../main.py` (line 108):
+```python
+SCOUT_ALTITUDE = 5.0  # Change this value to your desired altitude in meters
+```
+
+Example:
+```python
+SCOUT_ALTITUDE = 15.0  # Scout at 15 meters instead
+```
+
+This single constant controls all scouting altitudes throughout the system.
+
+**Option 2: Change During Runtime (Temporary)**
+
+Send the `ALT` command via radio/ground station:
+```
+ALT:20  # Set scout altitude to 20 meters
+```
+
+This change only affects the current session and will revert to the default value on next restart.
+
+**Option 3: Override in KML Survey Commands**
+
+When starting a KML-based survey, specify altitude:
+```
+SCOUT:KML:survey_area.kml,15  # Survey at 15 meters altitude
+```
+
+#### **Scout Altitude Parameters Summary**
+| Parameter | File | Line | Current Value | Notes |
+|-----------|------|------|---------------|-------|
+| `SCOUT_ALTITUDE` | `../main.py` | 108 | 5.0 m | Global constant for all scouting |
+| `self.scout_altitude` | `../main.py` | 160 | Uses SCOUT_ALTITUDE | Waypoint scouting altitude |
+| `self.default_kml_altitude` | `../main.py` | 164 | Uses SCOUT_ALTITUDE | KML survey altitude |
+
+**Recommended Ranges:**
+- **2-5m**: Low-altitude survey, detailed imagery, low speed
+- **5-15m**: Balanced coverage and detail, typical survey altitude
+- **15-30m**: Wider coverage, faster mission, less detail
 
 ---
 
@@ -457,6 +517,86 @@ python3 mission_control.py --connect /dev/ttyACM0
 5. **Full Mission:** Run complete 3-waypoint mission
 
 **Always have RC transmitter ready to switch to manual mode!**
+
+---
+
+## 📡 Real-Time Telemetry Logging
+
+The system includes comprehensive telemetry logging that sends all important events to your ground station (QGroundControl) in real-time.
+
+### What's Logged to Ground Station
+
+- **Pre-arm checks**: GPS, EKF, battery, compass status
+- **Failsafe events**: Battery low/critical, GPS loss, GCS timeout
+- **System status**: Mode changes, arm/disarm events
+- **Sensor health**: Accelerometer, gyro, magnetometer issues
+- **Battery monitoring**: Voltage drops, low voltage warnings
+- **GPS status**: Fix type changes, satellite count
+- **Flight controller messages**: All STATUSTEXT from ArduPilot
+
+### Viewing Logs in QGroundControl
+
+1. Open QGroundControl
+2. Connect to your vehicle
+3. Click the **speech bubble icon** (Messages) in the top toolbar
+4. All telemetry logs appear here in real-time
+
+### Using Telemetry with Mission Control
+
+Telemetry is **enabled by default**. All mission logs are sent to the ground station:
+
+```bash
+# Normal run with telemetry (default)
+python3 mission_control.py --connect /dev/ttyUSB0
+
+# Disable telemetry if needed
+python3 mission_control.py --connect /dev/ttyUSB0 --no-telemetry
+```
+
+### Standalone Telemetry Monitor
+
+For continuous monitoring without running a mission, use the dedicated telemetry monitor:
+
+```bash
+# Monitor via USB
+python3 telemetry_monitor.py --connect /dev/ttyACM0
+
+# Monitor via telemetry radio
+python3 telemetry_monitor.py --connect /dev/ttyUSB0
+
+# SITL monitoring
+python3 telemetry_monitor.py --connect udp:127.0.0.1:14551
+
+# Custom status report interval (default 10 seconds)
+python3 telemetry_monitor.py --connect /dev/ttyUSB0 --interval 5
+```
+
+### Telemetry Message Severity Levels
+
+Messages in QGC are color-coded by severity:
+
+| Level | Color | Description |
+|-------|-------|-------------|
+| EMERGENCY | Red | System unusable |
+| ALERT | Red | Immediate action required |
+| CRITICAL | Red | Critical failure |
+| ERROR | Orange | Error conditions |
+| WARNING | Yellow | Warning conditions |
+| NOTICE | Blue | Significant events (mode changes, arm) |
+| INFO | White | Informational |
+| DEBUG | Gray | Debug messages |
+
+### Telemetry Files Structure
+
+```
+utils/
+├── logger.py              # Console logging (now with telemetry forwarding)
+└── telemetry_logger.py    # MAVLink telemetry system
+    ├── TelemetryLogger      # Sends STATUSTEXT messages
+    ├── VehicleStatusMonitor # Continuous status monitoring
+    ├── PrearmCheckReporter  # Pre-arm check reporting
+    └── FailsafeMonitor      # Failsafe configuration/events
+```
 
 ---
 

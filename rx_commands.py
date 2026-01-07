@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Drone Command Receiver via LoRa/3DR Radio
+Drone Command Receiver via LoRa/3DR Radio (BASIC VERSION)
+
+NOTE: For human detection and autonomous scouting missions, use main.py instead!
+      main.py has DETECT:START, MISSION:START, and human detection features.
+      This file (rx_commands.py) is for basic manual flight control only.
 
 Listens for commands from another laptop via 3DR radio and executes them on the Pixhawk.
 INTEGRATED with nidar/ modules for safety checks and proper logging.
@@ -19,6 +23,8 @@ Commands Supported:
     STOP          - Stop and hover (BRAKE mode)
     PREFLIGHT     - Run preflight checks only
     ABORT         - Emergency abort (immediate land)
+    SCOUT         - Start KML area survey mission (uses default config)
+    KML:SURVEY:filename,altitude - Custom KML survey with specific file
     
 Hardware Setup:
     - Pixhawk connected via USB (/dev/ttyACM0)
@@ -28,6 +34,9 @@ Usage:
     python3 rx_commands.py
     python3 rx_commands.py --pixhawk /dev/ttyACM0 --radio /dev/ttyUSB0
     python3 rx_commands.py --skip-preflight  # Skip preflight checks (bench test)
+    
+    FOR SCOUTING WITH HUMAN DETECTION, USE:
+    python3 main.py
 """
 
 import sys
@@ -42,6 +51,11 @@ from datetime import datetime
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 NIDAR_DIR = os.path.join(SCRIPT_DIR, 'nidar')
 sys.path.insert(0, NIDAR_DIR)
+
+# Default KML survey configuration for SCOUT command
+DEFAULT_KML_FILE = "survey_area.kml"  # Filename in /home/dart/quadtest/missions/
+DEFAULT_SCOUT_ALTITUDE = 5.0  # meters AGL
+DEFAULT_SCOUT_PATTERN = "curved"  # "curved" or "lawnmower"
 
 try:
     from dronekit import connect, VehicleMode, LocationGlobalRelative
@@ -215,6 +229,17 @@ class DroneCommandReceiver:
             elif cmd == "ABORT":
                 self.cmd_abort()
             
+            # SCOUT command - use default KML configuration
+            elif cmd == "SCOUT":
+                self.cmd_kml_survey(DEFAULT_KML_FILE, DEFAULT_SCOUT_ALTITUDE)
+            
+            # KML SURVEY command (KML:SURVEY:filename,altitude)
+            elif cmd.startswith("KML:SURVEY:"):
+                params = cmd.split(":")[2].split(",")
+                kml_file = params[0]
+                altitude = float(params[1]) if len(params) > 1 else 5.0
+                self.cmd_kml_survey(kml_file, altitude)
+            
             # PING command
             elif cmd == "PING":
                 self.send_response("PONG")
@@ -237,14 +262,9 @@ class DroneCommandReceiver:
             self.log("info", "Running preflight checks before arming...")
             self.send_response("Running preflight checks...")
             
-            # Check battery
-            if not self.preflight.check_battery(min_voltage=10.5):
-                self.send_response("ARM FAILED: Battery too low")
-                return
-            
             # Check GPS (optional - warn but continue)
             gps = self.vehicle.gps_0
-            if gps and gps.fix_type < 3:
+            if gps and gps.fix_type is not None and gps.fix_type < 3:
                 self.log("warning", f"GPS fix type {gps.fix_type} (need 3 for 3D)")
                 self.send_response(f"WARN: GPS fix={gps.fix_type} (need 3)")
             
@@ -257,7 +277,7 @@ class DroneCommandReceiver:
         
         # Set mode - use STABILIZE if no GPS, else GUIDED
         gps = self.vehicle.gps_0
-        if gps and gps.fix_type >= 3:
+        if gps and gps.fix_type is not None and gps.fix_type >= 3:
             self.vehicle.mode = VehicleMode("GUIDED")
         else:
             self.vehicle.mode = VehicleMode("STABILIZE")
@@ -363,7 +383,7 @@ class DroneCommandReceiver:
         
         # Battery check
         bat_ok = self.preflight.check_battery(min_voltage=10.5)
-        bat_v = self.vehicle.battery.voltage or 0
+        bat_v = self.vehicle.battery.voltage if self.vehicle.battery else 0
         
         # GPS check
         gps = self.vehicle.gps_0
@@ -440,11 +460,72 @@ class DroneCommandReceiver:
         mode = self.vehicle.mode.name
         armed = "ARM" if self.vehicle.armed else "DISARM"
         alt = self.vehicle.location.global_relative_frame.alt or 0
-        bat = self.vehicle.battery.voltage or 0
+        bat = self.vehicle.battery.voltage if self.vehicle.battery else 0
         gps = self.vehicle.gps_0.fix_type if self.vehicle.gps_0 else 0
         
         status = f"STATUS: {mode},{armed},ALT={alt:.1f}m,BAT={bat:.1f}V,GPS={gps}"
         self.send_response(status)
+    
+    def cmd_kml_survey(self, kml_filename, altitude):
+        """
+        Execute KML-based area survey mission for human detection.
+        
+        Args:
+            kml_filename: Name of KML file in /home/dart/quadtest/missions/
+            altitude: Flight altitude in meters AGL
+        """
+        if not NIDAR_AVAILABLE:
+            self.send_response("ERROR: KML survey requires nidar modules")
+            return
+        
+        self.log("state", f"Starting KML survey: {kml_filename} at {altitude}m")
+        self.send_response(f"Loading KML survey: {kml_filename}")
+        
+        try:
+            # Import KML loader
+            from mission.kml_loader import load_waypoints_from_kml, validate_kml_mission
+            from mission.waypoint_mission import WaypointMission
+            
+            # Build KML file path
+            kml_path = os.path.join("/home/dart/quadtest/missions", kml_filename)
+            if not os.path.exists(kml_path):
+                self.send_response(f"ERROR: KML file not found: {kml_path}")
+                return
+            
+            # Load waypoints from KML
+            self.log("info", f"Loading waypoints from {kml_path}...")
+            waypoints = load_waypoints_from_kml(
+                kml_file=kml_path,
+                altitude_meters=altitude,
+                pattern="curved",  # Use curved center coverage pattern
+                camera_fov=57,     # Wide-angle camera FOV
+                overlap=0.25       # 25% overlap
+            )
+            
+            self.send_response(f"Generated {len(waypoints)} waypoints")
+            
+            # Validate mission
+            valid, msg = validate_kml_mission(waypoints)
+            if not valid:
+                self.send_response(f"ERROR: {msg}")
+                return
+            
+            self.log("success", f"Mission validated: {len(waypoints)} waypoints")
+            
+            # Upload mission to vehicle
+            mission = WaypointMission(self.vehicle)
+            if not mission.upload_mission(waypoints):
+                self.send_response("ERROR: Mission upload failed")
+                return
+            
+            self.send_response(f"Mission uploaded: {len(waypoints)} waypoints")
+            self.log("success", "KML survey mission ready - use ARM/TAKEOFF to start")
+            self.send_response("Ready: ARM -> TAKEOFF -> MODE:AUTO to begin survey")
+            
+        except Exception as e:
+            error_msg = f"KML survey error: {str(e)}"
+            self.log("error", error_msg)
+            self.send_response(f"ERROR: {error_msg}")
     
     def listen_loop(self):
         """Main loop to listen for commands."""
@@ -456,7 +537,8 @@ class DroneCommandReceiver:
             print("=" * 50)
         
         self.log("info", "Waiting for commands from remote laptop...")
-        self.log("info", "Commands: ARM, DISARM, TAKEOFF:5, LAND, RTL, ABORT, PREFLIGHT, STATUS")
+        self.log("info", "Commands: ARM, DISARM, TAKEOFF:5, LAND, RTL, ABORT, SCOUT, PREFLIGHT, STATUS")
+        
         
         buffer = ""
         

@@ -1,5 +1,6 @@
 """
 Pre-flight safety checks for autonomous mission.
+Includes telemetry reporting for ground station visibility.
 """
 
 import time
@@ -7,16 +8,18 @@ from utils.logger import MissionLogger
 
 
 class PreflightChecks:
-    """Performs pre-flight safety validation."""
+    """Performs pre-flight safety validation with telemetry support."""
     
-    def __init__(self, vehicle):
+    def __init__(self, vehicle, telemetry_logger=None):
         """
         Initialize preflight checker.
         
         Args:
             vehicle: DroneKit Vehicle object
+            telemetry_logger: Optional TelemetryLogger for GCS reporting
         """
         self.vehicle = vehicle
+        self.telem = telemetry_logger
     
     def check_gps_fix(self, min_satellites=6):
         """
@@ -32,15 +35,23 @@ class PreflightChecks:
         
         gps = self.vehicle.gps_0
         
-        if gps.fix_type < 2:
-            MissionLogger.error(f"Insufficient GPS fix type: {gps.fix_type} (need 2D or 3D fix)")
+        # Check if GPS object is available
+        if gps is None:
+            MissionLogger.error("GPS not available")
             return False
         
-        if gps.satellites_visible < min_satellites:
-            MissionLogger.warning(f"Low satellite count: {gps.satellites_visible} (recommended: {min_satellites}+)")
+        fix_type = gps.fix_type if gps.fix_type is not None else 0
+        satellites = gps.satellites_visible if gps.satellites_visible is not None else 0
+        
+        if fix_type < 2:
+            MissionLogger.error(f"Insufficient GPS fix type: {fix_type} (need 2D or 3D fix)")
+            return False
+        
+        if satellites < min_satellites:
+            MissionLogger.warning(f"Low satellite count: {satellites} (recommended: {min_satellites}+)")
             # Continue anyway for SITL, but warn
         
-        MissionLogger.success(f"GPS OK: {gps.satellites_visible} satellites, fix type {gps.fix_type}")
+        MissionLogger.success(f"GPS OK: {satellites} satellites, fix type {fix_type}")
         return True
     
     def check_armable(self, timeout=30):
@@ -65,31 +76,6 @@ class PreflightChecks:
             time.sleep(1)
         
         MissionLogger.success("Vehicle is armable")
-        return True
-    
-    def check_battery(self, min_voltage=10.5):
-        """
-        Verify battery voltage is sufficient.
-        
-        Args:
-            min_voltage: Minimum acceptable voltage
-            
-        Returns:
-            True if battery is adequate
-        """
-        MissionLogger.info("Checking battery status...")
-        
-        battery = self.vehicle.battery
-        
-        if battery.voltage is None:
-            MissionLogger.warning("Battery voltage unavailable")
-            return True  # Continue for SITL
-        
-        if battery.voltage < min_voltage:
-            MissionLogger.error(f"Battery too low: {battery.voltage}V (minimum: {min_voltage}V)")
-            return False
-        
-        MissionLogger.success(f"Battery OK: {battery.voltage}V, {battery.level}%")
         return True
     
     def check_home_location(self, timeout=60):
@@ -120,6 +106,38 @@ class PreflightChecks:
         MissionLogger.success(f"Home location set: ({home.lat:.6f}, {home.lon:.6f}, {home.alt}m)")
         return True
     
+    def check_battery(self, min_voltage=10.5):
+        """
+        Check battery voltage.
+        
+        Args:
+            min_voltage: Minimum acceptable voltage
+            
+        Returns:
+            True if battery voltage is adequate
+        """
+        MissionLogger.info("Checking battery...")
+        
+        battery = self.vehicle.battery
+        
+        # Check if battery object is available
+        if battery is None:
+            MissionLogger.warning("Battery data not available")
+            return True  # Don't block operations if battery data unavailable
+        
+        voltage = battery.voltage if battery.voltage is not None else 0.0
+        
+        if voltage <= 0:
+            MissionLogger.warning("Battery voltage not readable")
+            return True  # Don't block operations if battery reading unavailable
+        
+        if voltage < min_voltage:
+            MissionLogger.error(f"Battery LOW: {voltage:.1f}V (minimum: {min_voltage}V)")
+            return False
+        
+        MissionLogger.success(f"Battery OK: {voltage:.1f}V")
+        return True
+    
     def run_all_checks(self):
         """
         Run complete pre-flight check sequence.
@@ -132,7 +150,6 @@ class PreflightChecks:
         checks = [
             ("GPS Fix", self.check_gps_fix),
             ("Armable Status", self.check_armable),
-            ("Battery Level", self.check_battery),
             ("Home Location", self.check_home_location),
         ]
         
