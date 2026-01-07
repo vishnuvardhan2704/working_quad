@@ -3,7 +3,7 @@
 Drone Command Sender via LoRa/3DR Radio
 
 Send commands to drone from laptop via 3DR radio.
-This script runs on the REMOTE laptop (your friend's computer).
+This script runs on the REMOTE laptop (ground station).
 
 Commands:
     ARM           - Arm the drone
@@ -11,13 +11,15 @@ Commands:
     TAKEOFF:5     - Takeoff to 5 meters
     LAND          - Land the drone
     RTL           - Return to launch
+    SCOUT         - Start KML area survey mission (human detection)
+    KML:SURVEY:file,alt - Custom KML survey (e.g. KML:SURVEY:area.kml,20)
     MODE:STABILIZE - Change to stabilize mode
     MODE:LOITER   - Change to loiter mode
     MODE:GUIDED   - Change to guided mode
+    MODE:AUTO     - Start uploaded mission (after SCOUT/KML:SURVEY)
     GOTO:lat,lon,alt - Go to GPS location
-    MOVE:10,0,0   - Move 10m north
-    STOP          - Stop and hover
     STATUS        - Get drone status
+    ABORT         - Emergency abort
     PING          - Test connection
     
 Usage:
@@ -60,16 +62,53 @@ class DroneCommandSender:
     
     def receive_responses(self):
         """Background thread to receive responses from drone."""
+        buffer = ""
         while self.running:
             try:
                 if self.serial.in_waiting > 0:
-                    data = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if data:
-                        print(f"\n  >> {data}")
-                        print("CMD> ", end='', flush=True)
-            except:
+                    # Read all available data
+                    chunk = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore')
+                    buffer += chunk
+                    
+                    # Process complete lines
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        data = line.strip()
+                        if data:
+                            self._display_response(data)
+            except Exception as e:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.02)  # Faster polling
+    
+    def _display_response(self, data):
+        """Format and display received response."""
+        # ACK responses (PONG, OK, etc)
+        if "PONG" in data:
+            print(f"\n  ✅ \033[92m{data}\033[0m")  # Green for ACK
+        elif "HUMAN DETECTED" in data:
+            print(f"\n  🚨 {data}")
+        elif "DETECTION:" in data:
+            print(f"\n  📷 {data}")
+        elif "MISSION" in data:
+            print(f"\n  🛫 {data}")
+        # Telemetry messages from drone
+        elif "[TELEM]" in data:
+            # Color-code telemetry by severity
+            if "[ERROR]" in data or "[CRIT]" in data or "[EMERG]" in data:
+                print(f"\n  ❌ \033[91m{data}\033[0m")  # Red
+            elif "[WARN]" in data:
+                print(f"\n  ⚠️  \033[93m{data}\033[0m")  # Yellow
+            elif "[NOTICE]" in data:
+                print(f"\n  📢 \033[94m{data}\033[0m")  # Blue
+            else:
+                print(f"\n  📡 \033[96m{data}\033[0m")  # Cyan
+        elif "ERROR" in data:
+            print(f"\n  ❌ \033[91m{data}\033[0m")  # Red for errors
+        elif "OK" in data or "SUCCESS" in data or "ARMED" in data or "READY" in data:
+            print(f"\n  ✅ \033[92m{data}\033[0m")  # Green for success
+        else:
+            print(f"\n  >> {data}")
+        print("CMD> ", end='', flush=True)
     
     def send_command(self, cmd):
         """Send a command to the drone."""
@@ -88,14 +127,22 @@ class DroneCommandSender:
     def run_interactive(self):
         """Run interactive command mode."""
         print("\n" + "=" * 50)
-        print("  DRONE COMMAND SENDER")
+        print("  DRONE SCOUT - Ground Station")
         print("=" * 50)
-        print("\nAvailable commands:")
-        print("  ARM, DISARM, TAKEOFF:5, LAND, RTL")
-        print("  MODE:STABILIZE, MODE:LOITER, MODE:GUIDED")
-        print("  GOTO:lat,lon,alt, MOVE:n,e,d, STOP")
-        print("  STATUS, PING, QUIT")
-        print("\n" + "-" * 50)
+        print("\nQuick start (SCOUT auto-starts detection + recording):")
+        print("  1. SCOUT              <- Just this for ground test!")
+        print("  2. SCOUT:STOP         <- Stop and save video")
+        print("\nFull flight sequence:")
+        print("  1. ARM")
+        print("  2. TAKEOFF:10")
+        print("  3. SCOUT              <- Auto-starts detection + recording")
+        print("  4. RTL")
+        print("  5. SCOUT:STOP")
+        print("\nWith waypoints:")
+        print("  WP:lat,lon,alt -> SCOUT")
+        print("\nTelemetry: Real-time logs appear with 📡 prefix")
+        print("Type HELP for all commands")
+        print("-" * 50)
         
         self.running = True
         
@@ -135,25 +182,68 @@ class DroneCommandSender:
         """Show help message."""
         print("""
 Commands:
-  ARM            - Arm the drone motors
-  DISARM         - Disarm the drone motors
-  TAKEOFF:5      - Takeoff to 5 meters altitude
-  LAND           - Land the drone
-  RTL            - Return to launch point
+  === QUICK START (Ground Test) ===
+  SCOUT            - Start detection + recording (auto!)
+  SCOUT:STOP       - Stop everything and save video
   
-  MODE:STABILIZE - Manual stabilize mode
-  MODE:LOITER    - GPS hold/loiter mode
-  MODE:GUIDED    - Guided/autonomous mode
-  MODE:ALT_HOLD  - Altitude hold mode
+  === FULL FLIGHT SEQUENCE ===
+  1. ARM              - Arm the drone
+  2. TAKEOFF:10       - Takeoff to 10 meters
+  3. SCOUT            - Auto-starts detection + recording
+  4. RTL              - Return home after scouting
+  5. SCOUT:STOP       - Stop and save recording
   
-  GOTO:lat,lon,alt - Fly to GPS coordinates
-  MOVE:10,0,0      - Move 10m north (N,E,Down)
-  STOP             - Stop and hover
+  === WITH WAYPOINTS (optional) ===
+  WP:lat,lon,alt   - Add waypoint BEFORE SCOUT
+  WP:CLEAR         - Clear all waypoints
+  WP:LIST          - Show all waypoints
+  ALT:15           - Set default altitude (meters)
+  Then: SCOUT      - Flies waypoints with detection
   
-  STATUS         - Get drone status
-  PING           - Test connection
+  === FLIGHT COMMANDS ===
+  ARM              - Arm motors
+  DISARM           - Disarm motors
+  TAKEOFF:10       - Takeoff to 10 meters
+  LAND             - Land immediately
+  RTL              - Return to launch
+  GOTO:lat,lon,alt - Go to single location
+  ABORT            - Emergency stop
   
-  QUIT           - Exit program
+  === DETECTION (manual control) ===
+  DETECT:START     - Start camera + detection (no recording)
+  DETECT:STOP      - Stop detection
+  DETECT:STATUS    - Get detection count + recording status
+  DETECT:CONF:0.7  - Set confidence (0.1-1.0)
+  
+  === OTHER ===
+  STATUS           - Get drone status
+  PING             - Test connection
+  MODE:GUIDED      - Set guided mode
+  QUIT             - Exit program
+
+  === TELEMETRY ===
+  Real-time logs from drone appear automatically:
+  📡 [TELEM][INFO]   - Informational (cyan)
+  📢 [TELEM][NOTICE] - Mode changes, arm/disarm (blue)
+  ⚠️  [TELEM][WARN]   - Warnings (yellow)
+  ❌ [TELEM][ERROR]  - Errors (red)
+
+  === EXAMPLE: GROUND TEST ===
+  CMD> SCOUT
+  ... Detection running, video recording...
+  ... 🚨 HUMAN DETECTED alerts appear ...
+  CMD> SCOUT:STOP
+  ... Video saved to recordings/scout_YYYYMMDD_HHMMSS.mp4
+
+  === EXAMPLE: FULL FLIGHT ===
+  CMD> ARM
+  CMD> TAKEOFF:10
+  CMD> WP:12.9716,77.5946,10
+  CMD> WP:12.9720,77.5950,10
+  CMD> SCOUT
+  ... Flies to waypoints, detects humans, records video...
+  CMD> RTL
+  CMD> SCOUT:STOP
 """)
 
 

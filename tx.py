@@ -292,6 +292,8 @@ def main():
         radio.close()
         vehicle.close()
         print("✓ Cleanup complete")
+        print("\nLast 10 dmesg logs:")
+        os.system("dmesg | tail -10")
 
 
 if __name__ == "__main__":

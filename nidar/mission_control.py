@@ -4,6 +4,7 @@ Autonomous Drone Mission Control System
 ArduPilot + DroneKit Implementation
 
 This is the main entry point for waypoint-based autonomous navigation.
+Includes real-time telemetry logging to ground station.
 """
 
 import time
@@ -13,6 +14,13 @@ from dronekit import VehicleMode
 
 from utils.connection import VehicleConnection
 from utils.logger import MissionLogger
+from utils.telemetry_logger import (
+    TelemetryLogger, 
+    VehicleStatusMonitor, 
+    PrearmCheckReporter, 
+    FailsafeMonitor,
+    create_telemetry_system
+)
 from safety.preflight import PreflightChecks
 from safety.abort import SafetyAbort
 from mission.waypoint_mission import WaypointMission
@@ -22,28 +30,40 @@ from mission.mission_data import MissionData
 class MissionController:
     """Main mission control orchestrator."""
     
-    def __init__(self, connection_string):
+    def __init__(self, connection_string, enable_telemetry=True):
         """
         Initialize mission controller.
         
         Args:
             connection_string: MAVLink connection string
+            enable_telemetry: Whether to enable telemetry logging to ground station
         """
         self.connection_string = connection_string
+        self.enable_telemetry = enable_telemetry
         self.vehicle = None
         self.preflight = None
         self.safety = None
         self.mission = None
+        
+        # Telemetry system components
+        self.telem_logger = None
+        self.status_monitor = None
+        self.prearm_reporter = None
+        self.failsafe_monitor = None
         
         # Abort flag and lock for thread-safe abort handling
         self.abort_flag = False
         self.abort_lock = threading.Lock()
     
     def connect(self):
-        """Establish connection to vehicle."""
+        """Establish connection to vehicle and initialize telemetry."""
         self.vehicle = VehicleConnection.connect_vehicle(self.connection_string)
         if not self.vehicle:
             return False
+        
+        # Initialize telemetry system
+        if self.enable_telemetry:
+            self._setup_telemetry()
         
         # Initialize subsystems
         self.preflight = PreflightChecks(self.vehicle)
@@ -51,6 +71,37 @@ class MissionController:
         self.mission = WaypointMission(self.vehicle)
         
         return True
+    
+    def _setup_telemetry(self):
+        """Initialize telemetry logging system."""
+        MissionLogger.info("Initializing telemetry system...")
+        
+        try:
+            # Create telemetry components
+            (self.telem_logger, 
+             self.status_monitor, 
+             self.prearm_reporter, 
+             self.failsafe_monitor) = create_telemetry_system(self.vehicle)
+            
+            # Start telemetry logger
+            self.telem_logger.start()
+            
+            # Connect MissionLogger to telemetry
+            MissionLogger.set_telemetry_logger(self.telem_logger)
+            
+            # Start status monitor (continuous monitoring)
+            self.status_monitor.start()
+            
+            # Send initial status and failsafe config to ground station
+            time.sleep(0.5)  # Let system initialize
+            self.telem_logger.info("=== TELEMETRY ACTIVE ===")
+            self.failsafe_monitor.report_failsafe_config()
+            
+            MissionLogger.success("Telemetry system initialized - logs visible in GCS")
+            
+        except Exception as e:
+            MissionLogger.warning(f"Telemetry init failed: {e} - continuing without telemetry")
+            self.enable_telemetry = False
     
     def arm_and_takeoff(self, altitude):
         """
@@ -107,6 +158,11 @@ class MissionController:
         """Execute the complete autonomous mission sequence with abort capability."""
         
         try:
+            # Report pre-arm check status via telemetry
+            if self.enable_telemetry and self.prearm_reporter:
+                MissionLogger.info("Sending pre-arm status to ground station...")
+                self.prearm_reporter.report_prearm_status()
+            
             # Step 1: Pre-flight checks
             if not self.preflight.run_all_checks():
                 MissionLogger.error("Pre-flight checks failed - aborting mission")
@@ -229,6 +285,15 @@ class MissionController:
         """Clean shutdown sequence."""
         MissionLogger.header("SHUTDOWN")
         
+        # Stop telemetry system
+        if self.enable_telemetry:
+            if self.status_monitor:
+                self.status_monitor.stop()
+            if self.telem_logger:
+                self.telem_logger.info("Telemetry shutting down")
+                self.telem_logger.stop()
+            MissionLogger.set_telemetry_logger(None)
+        
         if self.vehicle:
             # Ensure vehicle is disarmed
             if self.vehicle.armed:
@@ -265,16 +330,24 @@ def main():
         default='udp:127.0.0.1:14551',
         help='Vehicle connection string (default: udp:127.0.0.1:14551 for SITL)'
     )
+    parser.add_argument(
+        '--no-telemetry',
+        action='store_true',
+        help='Disable telemetry logging to ground station'
+    )
     args = parser.parse_args()
+    
+    enable_telemetry = not args.no_telemetry
     
     # Display banner
     MissionLogger.header("AUTONOMOUS DRONE NAVIGATION SYSTEM")
     MissionLogger.info("ArduPilot + DroneKit Mission Control")
     MissionLogger.info(f"Connection: {args.connect}")
+    MissionLogger.info(f"Telemetry to GCS: {'ENABLED' if enable_telemetry else 'DISABLED'}")
     MissionLogger.info("Type 'abort' at any time to stop the mission")
     
     # Create controller
-    controller = MissionController(args.connect)
+    controller = MissionController(args.connect, enable_telemetry=enable_telemetry)
     
     try:
         # Connect to vehicle
