@@ -5,6 +5,7 @@ Waypoint mission upload and execution using ArduPilot AUTO mode.
 from dronekit import VehicleMode, Command
 from pymavlink import mavutil
 import time
+import threading
 from utils.logger import MissionLogger
 
 
@@ -19,13 +20,25 @@ class WaypointMission:
             vehicle: DroneKit Vehicle object
         """
         self.vehicle = vehicle
+        self._upload_result = None
+        self._upload_error = None
     
-    def upload_mission(self, waypoints):
+    def _upload_worker(self, cmds):
+        """Worker thread for mission upload."""
+        try:
+            cmds.upload()
+            self._upload_result = True
+        except Exception as e:
+            self._upload_error = str(e)
+            self._upload_result = False
+    
+    def upload_mission(self, waypoints, timeout=30):
         """
         Upload mission to vehicle using MAV_CMD_NAV_WAYPOINT.
         
         Args:
             waypoints: List of LocationGlobalRelative objects
+            timeout: Maximum time to wait for upload (seconds)
             
         Returns:
             True if upload successful, False otherwise
@@ -39,28 +52,44 @@ class WaypointMission:
         # Add takeoff command (will be handled separately in GUIDED mode)
         # AUTO mode mission starts from first waypoint
         
-        # Add waypoint commands with 5-second hover
+        # Add waypoint commands - fly through continuously (no hover)
+        # Only log first/last 5 waypoints to avoid flooding
         for i, waypoint in enumerate(waypoints):
             cmd = Command(
                 0, 0, 0,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
                 mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
                 0, 0,
-                5, 0, 0, 0,  # param1=5sec hold time, param2-4 (accept radius, pass radius, yaw)
+                0, 0, 0, 0,  # param1=0 (no hover), param2-4 (accept radius, pass radius, yaw)
                 waypoint.lat,
                 waypoint.lon,
                 waypoint.alt
             )
             cmds.add(cmd)
-            MissionLogger.info(f"  WP{i+1}: ({waypoint.lat:.6f}, {waypoint.lon:.6f}, {waypoint.alt}m) [hover 5s]")
+            # Only log first 5 and last 5 waypoints
+            if i < 5 or i >= len(waypoints) - 5:
+                MissionLogger.info(f"  WP{i+1}: ({waypoint.lat:.6f}, {waypoint.lon:.6f}, {waypoint.alt}m)")
+            elif i == 5:
+                MissionLogger.info(f"  ... ({len(waypoints) - 10} more waypoints) ...")
         
-        # Upload mission
-        try:
-            cmds.upload()
+        # Upload mission with timeout to prevent blocking
+        MissionLogger.info(f"Uploading to Pixhawk (timeout: {timeout}s)...")
+        self._upload_result = None
+        self._upload_error = None
+        
+        upload_thread = threading.Thread(target=self._upload_worker, args=(cmds,))
+        upload_thread.start()
+        upload_thread.join(timeout=timeout)
+        
+        if upload_thread.is_alive():
+            MissionLogger.error(f"Mission upload timed out after {timeout}s")
+            return False
+        
+        if self._upload_result:
             MissionLogger.success(f"Mission uploaded: {len(waypoints)} waypoints")
             return True
-        except Exception as e:
-            MissionLogger.error(f"Mission upload failed: {str(e)}")
+        else:
+            MissionLogger.error(f"Mission upload failed: {self._upload_error}")
             return False
     
     def start_mission(self):

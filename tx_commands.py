@@ -11,13 +11,15 @@ Commands:
     TAKEOFF:5     - Takeoff to 5 meters
     LAND          - Land the drone
     RTL           - Return to launch
-    SCOUT         - Start detection + recording (auto)
-    SCOUT:STOP    - Stop detection, recording, mission
+    SCOUT         - Start KML area survey mission (human detection)
+    KML:SURVEY:file,alt - Custom KML survey (e.g. KML:SURVEY:area.kml,20)
     MODE:STABILIZE - Change to stabilize mode
     MODE:LOITER   - Change to loiter mode
     MODE:GUIDED   - Change to guided mode
+    MODE:AUTO     - Start uploaded mission (after SCOUT/KML:SURVEY)
     GOTO:lat,lon,alt - Go to GPS location
     STATUS        - Get drone status
+    ABORT         - Emergency abort
     PING          - Test connection
     
 Usage:
@@ -60,35 +62,53 @@ class DroneCommandSender:
     
     def receive_responses(self):
         """Background thread to receive responses from drone."""
+        buffer = ""
         while self.running:
             try:
                 if self.serial.in_waiting > 0:
-                    data = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if data:
-                        # Format based on message type
-                        if "HUMAN DETECTED" in data:
-                            print(f"\n  🚨 {data}")
-                        elif "DETECTION:" in data:
-                            print(f"\n  📷 {data}")
-                        elif "MISSION" in data:
-                            print(f"\n  🛫 {data}")
-                        # Telemetry messages from drone
-                        elif "[TELEM]" in data:
-                            # Color-code telemetry by severity
-                            if "[ERROR]" in data or "[CRIT]" in data or "[EMERG]" in data:
-                                print(f"\n  ❌ \033[91m{data}\033[0m")  # Red
-                            elif "[WARN]" in data:
-                                print(f"\n  ⚠️  \033[93m{data}\033[0m")  # Yellow
-                            elif "[NOTICE]" in data:
-                                print(f"\n  📢 \033[94m{data}\033[0m")  # Blue
-                            else:
-                                print(f"\n  📡 \033[96m{data}\033[0m")  # Cyan
-                        else:
-                            print(f"\n  >> {data}")
-                        print("CMD> ", end='', flush=True)
-            except:
+                    # Read all available data
+                    chunk = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore')
+                    buffer += chunk
+                    
+                    # Process complete lines
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        data = line.strip()
+                        if data:
+                            self._display_response(data)
+            except Exception as e:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.02)  # Faster polling
+    
+    def _display_response(self, data):
+        """Format and display received response."""
+        # ACK responses (PONG, OK, etc)
+        if "PONG" in data:
+            print(f"\n  ✅ \033[92m{data}\033[0m")  # Green for ACK
+        elif "HUMAN DETECTED" in data:
+            print(f"\n  🚨 {data}")
+        elif "DETECTION:" in data:
+            print(f"\n  📷 {data}")
+        elif "MISSION" in data:
+            print(f"\n  🛫 {data}")
+        # Telemetry messages from drone
+        elif "[TELEM]" in data:
+            # Color-code telemetry by severity
+            if "[ERROR]" in data or "[CRIT]" in data or "[EMERG]" in data:
+                print(f"\n  ❌ \033[91m{data}\033[0m")  # Red
+            elif "[WARN]" in data:
+                print(f"\n  ⚠️  \033[93m{data}\033[0m")  # Yellow
+            elif "[NOTICE]" in data:
+                print(f"\n  📢 \033[94m{data}\033[0m")  # Blue
+            else:
+                print(f"\n  📡 \033[96m{data}\033[0m")  # Cyan
+        elif "ERROR" in data:
+            print(f"\n  ❌ \033[91m{data}\033[0m")  # Red for errors
+        elif "OK" in data or "SUCCESS" in data or "ARMED" in data or "READY" in data:
+            print(f"\n  ✅ \033[92m{data}\033[0m")  # Green for success
+        else:
+            print(f"\n  >> {data}")
+        print("CMD> ", end='', flush=True)
     
     def send_command(self, cmd):
         """Send a command to the drone."""

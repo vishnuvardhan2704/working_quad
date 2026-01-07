@@ -14,6 +14,7 @@ Commands received from ground station (tx_commands.py):
     STATUS            - Get drone status
     PREFLIGHT         - Run preflight checks
     ARM               - Arm the drone
+    FORCEARM          - Force arm (bypass pre-arm checks)
     DISARM            - Disarm the drone
     TAKEOFF:5         - Takeoff to 5 meters
     LAND              - Land immediately
@@ -31,7 +32,8 @@ Commands received from ground station (tx_commands.py):
     DETECT:CONF:0.7   - Set confidence threshold (0.1-1.0)
     
     Scout Commands (auto-starts detection + recording):
-    SCOUT             - Start detection + recording (stationary if no waypoints)
+    SCOUT             - Start KML area survey mission (loads default KML file)
+    SCOUT:KML:file,alt - Custom KML survey (e.g. SCOUT:KML:park.kml,20)
     SCOUT:STOP        - Stop scouting, detection, and save recording
 
 Usage:
@@ -96,6 +98,17 @@ except ImportError as e:
     NIDAR_AVAILABLE = False
     TELEMETRY_AVAILABLE = False
 
+# Import session file logger for persistent log storage
+try:
+    from utils.file_logger import SessionFileLogger, init_session_logging, get_session_logger
+    FILE_LOGGING_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] File logging not available: {e}")
+    FILE_LOGGING_AVAILABLE = False
+
+# Global constants - change these values to modify drone behavior
+SCOUT_ALTITUDE = 5.0  # Default altitude for all scouting missions (meters AGL)
+
 
 class MainController:
     """
@@ -145,7 +158,12 @@ class MainController:
         
         # Dynamic waypoints (sent from ground station)
         self.waypoints = []  # List of (lat, lon, alt) tuples
-        self.scout_altitude = 10.0  # Default scout altitude
+        self.scout_altitude = SCOUT_ALTITUDE  # Default scout altitude
+        
+        # Default KML survey configuration for SCOUT command
+        self.default_kml_file = "survey_area.kml"  # Filename in /home/dart/quadtest/missions/
+        self.default_kml_altitude = SCOUT_ALTITUDE  # meters AGL
+        self.default_kml_pattern = "curved"  # "curved" or "lawnmower"
         
         # Radio telemetry system (sends logs to tx_commands.py)
         self.telem_logger = None
@@ -224,6 +242,10 @@ class MainController:
             # Connect MissionLogger to telemetry (console logs also go to radio)
             MissionLogger.set_telemetry_logger(self.telem_logger)
             
+            # Connect SessionFileLogger to telemetry (stderr logs also go to radio)
+            if FILE_LOGGING_AVAILABLE:
+                SessionFileLogger.set_radio_telemetry(self.telem_logger)
+            
             # Start continuous status monitor (sends updates every 5 seconds)
             self.status_monitor.start(interval=5)
             
@@ -262,10 +284,13 @@ class MainController:
             return False
     
     def send_response(self, msg):
-        """Send response to ground station."""
+        """Send response to ground station with timestamp."""
         try:
-            response = f"[DRONE] {msg}\n"
+            # Add timestamp to message for sync verification
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+            response = f"[{timestamp}] [DRONE] {msg}\n"
             self.radio.write(response.encode())
+            self.radio.flush()  # Ensure data is sent immediately
             self.log("info", f"[TX] {msg}")
         except Exception as e:
             self.log("error", f"Failed to send: {e}")
@@ -295,6 +320,10 @@ class MainController:
             # Arm
             elif cmd == "ARM":
                 self.cmd_arm()
+            
+            # Force Arm (bypass pre-arm checks)
+            elif cmd == "FORCEARM":
+                self.cmd_force_arm()
             
             # Disarm
             elif cmd == "DISARM":
@@ -376,8 +405,19 @@ class MainController:
                 self.scout_altitude = alt
                 self.send_response(f"Scout altitude set to {alt}m")
             
-            elif cmd == "SCOUT" or cmd == "SCOUT:START":
-                # Start scouting - auto-starts detection and recording
+            elif cmd == "SCOUT":
+                # SCOUT - Load default KML and start survey
+                self.cmd_scout_kml(self.default_kml_file, self.default_kml_altitude)
+            
+            elif cmd.startswith("SCOUT:KML:"):
+                # SCOUT:KML:filename,altitude
+                params = cmd.split(":")[2].split(",")
+                kml_file = params[0]
+                altitude = float(params[1]) if len(params) > 1 else self.default_kml_altitude
+                self.cmd_scout_kml(kml_file, altitude)
+            
+            elif cmd == "SCOUT:START":
+                # Legacy SCOUT:START - waypoint mode
                 self.cmd_scout_start()
             
             elif cmd == "SCOUT:STOP":
@@ -447,7 +487,7 @@ class MainController:
         
         # Set mode based on GPS
         gps = self.vehicle.gps_0
-        if gps and gps.fix_type >= 3:
+        if gps and gps.fix_type is not None and gps.fix_type >= 3:
             self.vehicle.mode = VehicleMode("GUIDED")
         else:
             self.vehicle.mode = VehicleMode("STABILIZE")
@@ -465,6 +505,48 @@ class MainController:
         
         self.log("success", "Vehicle ARMED")
         self.send_response(f"ARMED OK (mode={self.vehicle.mode.name})")
+    
+    def cmd_force_arm(self):
+        """Force arm the drone, bypassing ALL pre-arm checks."""
+        if self.vehicle.armed:
+            self.send_response("Already armed")
+            return
+        
+        self.log("warning", "FORCE ARM - bypassing pre-arm checks!")
+        
+        # Set mode to STABILIZE (most permissive)
+        self.vehicle.mode = VehicleMode("STABILIZE")
+        time.sleep(1)
+        
+        # Force arm by setting the parameter to skip safety checks
+        # This uses MAVLink COMMAND_LONG with force flag
+        try:
+            from pymavlink import mavutil
+            msg = self.vehicle.message_factory.command_long_encode(
+                0, 0,    # target system, target component
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,       # confirmation
+                1,       # param1 (1=arm, 0=disarm)
+                21196,   # param2 (force arm magic number - bypasses checks)
+                0, 0, 0, 0, 0
+            )
+            self.vehicle.send_mavlink(msg)
+            self.vehicle.flush()
+        except Exception as e:
+            self.log("error", f"Force arm MAVLink failed: {e}")
+            # Fallback to standard arming
+            self.vehicle.armed = True
+        
+        timeout = 10
+        start = time.time()
+        while not self.vehicle.armed:
+            if time.time() - start > timeout:
+                self.send_response("FORCE ARM FAILED: Timeout")
+                return
+            time.sleep(0.5)
+        
+        self.log("success", "Vehicle FORCE ARMED (checks bypassed)")
+        self.send_response(f"FORCE ARMED OK (mode={self.vehicle.mode.name})")
     
     def cmd_disarm(self):
         """Disarm the drone."""
@@ -657,6 +739,101 @@ class MainController:
             self.send_response("SCOUT: Detection ON, recording ON (stationary mode - no waypoints)")
             self.send_response("Tip: Add waypoints with WP:lat,lon,alt or send SCOUT:STOP when done")
     
+    def cmd_scout_kml(self, kml_filename, altitude):
+        """
+        Execute KML-based area survey mission with human detection.
+        Loads KML file, generates coverage waypoints, uploads mission.
+        
+        Args:
+            kml_filename: Name of KML file in /home/dart/quadtest/missions/
+            altitude: Flight altitude in meters AGL
+        """
+        self.log("state", f"SCOUT: Loading KML survey {kml_filename} @ {altitude}m")
+        self.send_response(f"Loading KML survey: {kml_filename}")
+        
+        try:
+            # Import KML loader
+            sys.path.insert(0, NIDAR_DIR)
+            from mission.kml_loader import load_waypoints_from_kml, validate_kml_mission
+            from mission.waypoint_mission import WaypointMission
+            
+            # Build KML file path
+            kml_path = os.path.join(SCRIPT_DIR, "missions", kml_filename)
+            if not os.path.exists(kml_path):
+                self.send_response(f"ERROR: KML file not found: {kml_path}")
+                return
+            
+            # Load waypoints from KML
+            self.log("info", f"Generating waypoints from {kml_path}...")
+            waypoints = load_waypoints_from_kml(
+                kml_file=kml_path,
+                altitude_meters=altitude,
+                pattern=self.default_kml_pattern,
+                camera_fov=57,
+                overlap=0.25
+            )
+            
+            self.send_response(f"Generated {len(waypoints)} waypoints")
+            self.log("info", f"KML survey: {len(waypoints)} waypoints generated")
+            
+            # Validate mission
+            valid, msg = validate_kml_mission(waypoints)
+            if not valid:
+                self.send_response(f"ERROR: {msg}")
+                return
+            
+            # Upload mission to vehicle
+            mission = WaypointMission(self.vehicle)
+            if not mission.upload_mission(waypoints):
+                self.send_response("ERROR: Mission upload failed")
+                return
+            
+            self.send_response(f"Mission uploaded: {len(waypoints)} waypoints")
+            self.log("success", "KML survey mission uploaded to Pixhawk")
+            
+            # Auto-start detection with recording
+            if not self.detection_running:
+                self.log("info", "SCOUT: Auto-starting detection with camera recording...")
+                self._start_detection_with_recording()
+                
+                if not self.detection_running:
+                    self.send_response("ERROR: Failed to start detection/camera")
+                    return
+            elif not self.recording:
+                # Detection running but not recording - start recording
+                self._start_recording()
+            
+            # Reset abort flag
+            with self.abort_lock:
+                self.abort_flag = False
+            
+            # Check if armed
+            if not self.vehicle.armed:
+                self.send_response("SCOUT: Mission ready. Send ARM and TAKEOFF to begin.")
+                self.send_response(f"Camera: {'ON' if self.detection_running else 'FAILED'}")
+                return
+            
+            # Check if in air
+            current_alt = self.vehicle.location.global_relative_frame.alt or 0
+            if current_alt < 2.0:
+                self.send_response(f"SCOUT: Mission ready. Send TAKEOFF:{altitude} to begin.")
+                self.send_response(f"Camera: {'ON' if self.detection_running else 'FAILED'}")
+                return
+            
+            # Armed and airborne - auto-start mission
+            self.send_response(f"SCOUT: Starting AUTO mode with {len(waypoints)} waypoints")
+            self.send_response(f"Camera: {'ON' if self.detection_running else 'FAILED'}")
+            
+            # Start scout mission in separate thread
+            self.mission_running = True
+            self.mission_thread = threading.Thread(target=self._run_scout_mission_auto, daemon=True)
+            self.mission_thread.start()
+            
+        except Exception as e:
+            error_msg = f"KML survey error: {str(e)}"
+            self.log("error", error_msg)
+            self.send_response(f"ERROR: {error_msg}")
+    
     def cmd_scout_stop(self):
         """Stop scouting - stops mission, detection, and recording."""
         # Stop mission if running
@@ -696,29 +873,45 @@ class MainController:
             self.use_realsense = False
             if REALSENSE_AVAILABLE:
                 try:
+                    self.log("info", "Attempting to initialize RealSense camera...")
                     self.rs_pipeline = rs.pipeline()
                     config = rs.config()
                     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
                     self.rs_pipeline.start(config)
                     self.use_realsense = True
-                    self.log("success", "RealSense COLOR stream initialized (640x480)")
+                    self.log("success", "✓ RealSense COLOR camera initialized (640x480 @ 30fps)")
+                    self.send_response("CAMERA: RealSense ONLINE")
                 except Exception as e:
-                    self.log("warning", f"RealSense init failed: {e}, falling back to OpenCV")
+                    self.log("warning", f"RealSense init failed: {e}, trying OpenCV...")
+                    self.send_response(f"Camera: RealSense failed, trying USB camera...")
                     self.rs_pipeline = None
             
             # Fallback to OpenCV if RealSense not available
             if not self.use_realsense:
+                self.log("info", "Attempting to initialize USB camera (OpenCV)...")
+                attempted_devices = []
                 self.camera = cv2.VideoCapture(2)
+                attempted_devices.append(2)
+                
                 if not self.camera.isOpened():
+                    self.log("warning", "/dev/video2 failed, trying alternatives...")
                     for idx in [4, 0, 1]:
                         self.camera = cv2.VideoCapture(idx)
+                        attempted_devices.append(idx)
                         if self.camera.isOpened():
-                            self.log("info", f"Using camera /dev/video{idx}")
+                            self.log("success", f"✓ USB Camera initialized on /dev/video{idx}")
+                            self.send_response(f"CAMERA: USB /dev/video{idx} ONLINE")
                             break
                 
                 if not self.camera.isOpened():
-                    self.send_response("ERROR: Could not open camera")
+                    devices_tried = ", ".join([f"/dev/video{i}" for i in attempted_devices])
+                    self.log("error", f"✗ Camera initialization FAILED - tried: {devices_tried}")
+                    self.send_response(f"ERROR: Camera not found (tried {devices_tried})")
                     return
+                else:
+                    if 2 in attempted_devices and attempted_devices[0] == 2 and self.camera.isOpened():
+                        self.log("success", "✓ USB Camera initialized on /dev/video2")
+                        self.send_response("CAMERA: USB /dev/video2 ONLINE")
                 
                 self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -746,8 +939,9 @@ class MainController:
             self.detection_thread = threading.Thread(target=self._detection_loop_with_recording, daemon=True)
             self.detection_thread.start()
             
-            cam_type = "RealSense" if self.use_realsense else "OpenCV"
-            self.log("success", f"Detection started with recording ({cam_type})")
+            cam_type = "RealSense" if self.use_realsense else "USB OpenCV"
+            self.log("success", f"✓ Detection system ACTIVE with {cam_type} camera")
+            self.send_response(f"DETECTION: ACTIVE ({cam_type} recording)")
             
         except Exception as e:
             self.log("error", f"Detection start failed: {e}")
@@ -784,12 +978,38 @@ class MainController:
                 (640, 480)
             )
             
+            # CRITICAL: Check if VideoWriter actually opened successfully
+            if not self.video_writer.isOpened():
+                self.log("error", f"VideoWriter failed to open: {self.recording_path}")
+                self.log("error", "Trying alternative codec (XVID)...")
+                
+                # Try XVID codec as fallback
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                self.recording_path = os.path.join(recordings_dir, f"scout_{timestamp}.avi")
+                self.video_writer = cv2.VideoWriter(
+                    self.recording_path,
+                    fourcc,
+                    30.0,
+                    (640, 480)
+                )
+                
+                if not self.video_writer.isOpened():
+                    self.log("error", "VideoWriter failed with both mp4v and XVID codecs")
+                    self.send_response("ERROR: Video recording failed - codec issue")
+                    self.recording = False
+                    self.video_writer = None
+                    return
+                else:
+                    self.log("warning", f"Using XVID codec (AVI format): {self.recording_path}")
+            
             self.recording = True
             self.recording_start_time = time.time()
             self.log("success", f"Recording started: {self.recording_path}")
+            self.send_response(f"REC: Started - {os.path.basename(self.recording_path)}")
             
         except Exception as e:
             self.log("error", f"Failed to start recording: {e}")
+            self.send_response(f"ERROR: Recording failed - {e}")
             self.recording = False
             self.video_writer = None
     
@@ -861,6 +1081,61 @@ class MainController:
         except Exception as e:
             self.log("error", f"Scout error: {e}")
             self.send_response(f"SCOUT ERROR: {e}")
+            self._stop_recording()
+        
+        finally:
+            self.mission_running = False
+    
+    def _run_scout_mission_auto(self):
+        """Execute AUTO mode KML survey mission with human detection."""
+        self.mission_running = True
+        
+        try:
+            # Switch to AUTO mode
+            self.log("info", "Switching to AUTO mode for mission...")
+            self.vehicle.mode = VehicleMode("AUTO")
+            time.sleep(2)
+            
+            if self.vehicle.mode.name != "AUTO":
+                self.send_response("ERROR: Failed to switch to AUTO mode")
+                self.mission_running = False
+                return
+            
+            self.send_response(f"AUTO mode active - mission started")
+            self.log("success", "AUTO mode activated - ArduPilot executing mission")
+            
+            # Monitor mission progress
+            last_wp = 0
+            while self.vehicle.armed:
+                # Check abort
+                with self.abort_lock:
+                    if self.abort_flag:
+                        self.send_response("SCOUT: Aborting mission")
+                        self.vehicle.mode = VehicleMode("RTL")
+                        break
+                
+                # Get current waypoint
+                current_wp = self.vehicle.commands.next
+                if current_wp != last_wp and current_wp > 0:
+                    self.send_response(f"Waypoint {current_wp}/{self.vehicle.commands.count}")
+                    self.log("info", f"Progress: WP {current_wp}/{self.vehicle.commands.count}")
+                    last_wp = current_wp
+                
+                # Check if mission complete
+                if current_wp == 0 and last_wp > 0:
+                    self.send_response("Mission waypoints complete!")
+                    break
+                
+                time.sleep(2)
+            
+            # Stop recording
+            self._stop_recording()
+            self.send_response(f"SCOUT COMPLETE! Total detections: {self.detection_count}")
+            self.log("success", f"KML survey complete - {self.detection_count} human detections")
+            
+        except Exception as e:
+            self.log("error", f"AUTO mission error: {e}")
+            self.send_response(f"ERROR: {e}")
             self._stop_recording()
         
         finally:
@@ -1350,13 +1625,58 @@ class MainController:
     
     # ==================== MAIN LOOP ====================
     
+    def reconnect_radio(self):
+        """Attempt to reconnect to the radio after disconnection."""
+        max_retries = 10
+        retry_delay = 3  # seconds
+        
+        self.log("warning", "Radio disconnected - attempting reconnection...")
+        
+        # Close existing connection if any
+        if self.radio:
+            try:
+                self.radio.close()
+            except:
+                pass
+            self.radio = None
+        
+        for attempt in range(1, max_retries + 1):
+            self.log("info", f"Reconnection attempt {attempt}/{max_retries}...")
+            
+            # Check if symlink exists
+            if not os.path.exists(self.radio_port):
+                self.log("warning", f"Radio port {self.radio_port} not found, waiting...")
+                time.sleep(retry_delay)
+                continue
+            
+            try:
+                self.radio = serial.Serial(
+                    port=self.radio_port,
+                    baudrate=self.radio_baud,
+                    timeout=0.1
+                )
+                self.log("success", "Radio reconnected successfully!")
+                
+                # Update telemetry logger with new radio reference
+                if self.telem_logger:
+                    self.telem_logger.set_radio(self.radio)
+                    self.telem_logger.enable(True)
+                
+                return True
+            except Exception as e:
+                self.log("error", f"Reconnection failed: {e}")
+                time.sleep(retry_delay)
+        
+        self.log("error", f"Failed to reconnect after {max_retries} attempts")
+        return False
+    
     def listen_loop(self):
         """Main loop - listen for commands."""
         self.log("header", "LISTENING FOR COMMANDS")
         self.log("info", "Waiting for commands from ground station...")
         self.log("info", "Scout: SCOUT (auto-starts detection+recording), SCOUT:STOP")
         self.log("info", "Waypoints: WP:lat,lon,alt, WP:CLEAR, WP:LIST")
-        self.log("info", "Flight: ARM, TAKEOFF:x, LAND, RTL, ABORT")
+        self.log("info", "Flight: ARM, FORCEARM, TAKEOFF:x, LAND, RTL, ABORT")
         self.log("info", "Detection: DETECT:START, DETECT:STOP, DETECT:STATUS")
         
         # Send ready message
@@ -1364,6 +1684,8 @@ class MainController:
         self.send_response(f"DRONE READY - Detection {detection_status}")
         
         buffer = ""
+        consecutive_errors = 0
+        max_consecutive_errors = 5  # Trigger reconnect after 5 consecutive errors
         
         while self.running:
             try:
@@ -1377,11 +1699,32 @@ class MainController:
                         if cmd:
                             self.execute_command(cmd)
                 
+                consecutive_errors = 0  # Reset on success
                 time.sleep(0.05)
                 
             except KeyboardInterrupt:
                 self.log("info", "Stopping...")
                 break
+            except OSError as e:
+                # I/O errors (errno 5) indicate radio disconnection
+                consecutive_errors += 1
+                self.log("error", f"Radio I/O error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log("warning", "Too many consecutive errors - radio likely disconnected")
+                    if self.reconnect_radio():
+                        consecutive_errors = 0
+                        buffer = ""  # Clear buffer after reconnect
+                        self.send_response("DRONE RECONNECTED")
+                    else:
+                        self.log("error", "Radio reconnection failed - continuing without radio")
+                        # Keep trying periodically
+                        time.sleep(10)
+                        if self.reconnect_radio():
+                            consecutive_errors = 0
+                            buffer = ""
+                else:
+                    time.sleep(1)
             except Exception as e:
                 self.log("error", f"Error: {e}")
                 time.sleep(1)
@@ -1448,13 +1791,19 @@ class MainController:
 
 
 def main():
+    # Initialize session file logging first (captures all output)
+    session_logger = None
+    if FILE_LOGGING_AVAILABLE:
+        session_logger = init_session_logging()
+        print(f"[INFO] Session logs being saved to: {session_logger.session_file}")
+    
     parser = argparse.ArgumentParser(description='Autonomous Drone Controller with LoRa Interface')
     parser.add_argument('--pixhawk', default='/dev/ttyACM0',
                        help='Pixhawk port (default: /dev/ttyACM0)')
     parser.add_argument('--pixhawk-baud', type=int, default=115200,
                        help='Pixhawk baud rate (default: 115200)')
-    parser.add_argument('--radio', default='/dev/ttyUSB0',
-                       help='LoRa/3DR radio port (default: /dev/ttyUSB0)')
+    parser.add_argument('--radio', default='/dev/ttyUSB-radio',
+                       help='LoRa/3DR radio port (default: /dev/ttyUSB-radio)')
     parser.add_argument('--radio-baud', type=int, default=57600,
                        help='Radio baud rate (default: 57600)')
     parser.add_argument('--no-radio', action='store_true',
@@ -1469,7 +1818,13 @@ def main():
         require_radio=not args.no_radio
     )
     
-    success = controller.run()
+    try:
+        success = controller.run()
+    finally:
+        # Close session logger to write footer
+        if session_logger:
+            session_logger.close()
+    
     sys.exit(0 if success else 1)
 
 

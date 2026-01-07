@@ -193,15 +193,28 @@ class VehicleStatusMonitor:
     def _setup_listeners(self):
         """Setup MAVLink message listeners for failsafe events."""
         
+        # Store reference to self for use in closures
+        monitor_self = self
+        
         @self.vehicle.on_message('STATUSTEXT')
         def statustext_listener(self_vehicle, name, message):
             """Forward ArduPilot STATUSTEXT messages."""
             # These are messages from the flight controller itself
             text = message.text.decode('utf-8') if isinstance(message.text, bytes) else message.text
             # Don't re-send our own messages to avoid loops
-            if not text.startswith(('EMERG:', 'ALERT:', 'CRIT:', 'ERR:', 'WARN:', 'DBG:')):
+            if not text.startswith(('EMERG:', 'ALERT:', 'CRIT:', 'ERR:', 'WARN:', 'DBG:', '[TELEM]')):
                 severity = message.severity
-                self.telem._queue_message(severity, f"FC: {text}")
+                fc_msg = f"FC: {text}"
+                
+                # Map MAVLink severity to logging method
+                if severity <= 2:  # EMERGENCY, ALERT, CRITICAL
+                    monitor_self.telem.critical(fc_msg)
+                elif severity == 3:  # ERROR
+                    monitor_self.telem.error(fc_msg)
+                elif severity == 4:  # WARNING
+                    monitor_self.telem.warning(fc_msg)
+                else:  # NOTICE, INFO, DEBUG
+                    monitor_self.telem.info(fc_msg)
         
         @self.vehicle.on_message('SYS_STATUS')
         def sys_status_listener(self_vehicle, name, message):
@@ -305,7 +318,9 @@ class VehicleStatusMonitor:
                 self._check_gcs_heartbeat()
                 self._check_rc_signal()
             except Exception as e:
-                self.telem.error(f"Monitor error: {str(e)[:30]}")
+                # Replace % with %% to avoid format string errors
+                err_msg = str(e)[:30].replace('%', '%%')
+                self.telem.error(f"Monitor error: {err_msg}")
             
             time.sleep(1)  # Check every second
     
@@ -698,6 +713,9 @@ class RadioTelemetryLogger:
         self._lock = threading.Lock()
         self._enabled = True
         self._min_level = self.LEVEL_INFO  # Only send INFO and above by default
+        self._error_count = 0
+        self._max_errors_before_suppress = 5
+        self._suppressed = False
         
     def set_min_level(self, level):
         """Set minimum log level to send (0=all, 7=debug only)."""
@@ -706,10 +724,21 @@ class RadioTelemetryLogger:
     def enable(self, enabled=True):
         """Enable or disable telemetry sending."""
         self._enabled = enabled
+        if enabled:
+            # Reset error state when re-enabled
+            self._error_count = 0
+            self._suppressed = False
+        
+    def set_radio(self, radio_serial):
+        """Update the radio serial object (used after reconnection)."""
+        with self._lock:
+            self.radio = radio_serial
+            self._error_count = 0
+            self._suppressed = False
         
     def _send(self, level, message):
         """Send a telemetry message via radio."""
-        if not self._enabled or not self.radio:
+        if not self._enabled or not self.radio or self._suppressed:
             return
         
         if level > self._min_level:
@@ -717,10 +746,24 @@ class RadioTelemetryLogger:
             
         try:
             with self._lock:
+                # Add timestamp for sync verification with TX logs
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
                 level_name = self.LEVEL_NAMES.get(level, "INFO")
-                # Format: [TELEM][LEVEL] message
-                line = f"{self.prefix}[{level_name}] {message}\n"
+                # Format: [HH:MM:SS.mmm] [TELEM][LEVEL] message
+                line = f"[{timestamp}] {self.prefix}[{level_name}] {message}\n"
                 self.radio.write(line.encode())
+                # Reset error count on success
+                self._error_count = 0
+        except (OSError, IOError) as e:
+            # I/O errors indicate radio disconnection
+            self._error_count += 1
+            if self._error_count >= self._max_errors_before_suppress:
+                if not self._suppressed:
+                    print(f"[RadioTelem] Radio disconnected - suppressing telemetry until reconnect")
+                    self._suppressed = True
+            elif self._error_count == 1:
+                print(f"[RadioTelem] Send failed: {e}")
         except Exception as e:
             print(f"[RadioTelem] Send failed: {e}")
     
@@ -825,7 +868,9 @@ class RadioStatusMonitor:
                     last_status = time.time()
                     
             except Exception as e:
-                self.telem.error(f"Monitor err: {str(e)[:25]}")
+                # Replace % with %% to avoid format string errors when exception contains %
+                err_msg = str(e)[:25].replace('%', '%%')
+                self.telem.error(f"Monitor err: {err_msg}")
                 
             time.sleep(1)
     
@@ -869,9 +914,9 @@ class RadioStatusMonitor:
     def _check_gps(self):
         """Check GPS status."""
         gps = self.vehicle.gps_0
-        # Use dummy values if GPS object is None
-        fix_type = gps.fix_type if gps else -1
-        satellites = gps.satellites_visible if gps else 0
+        # Use dummy values if GPS object is None or attributes are None
+        fix_type = gps.fix_type if (gps and gps.fix_type is not None) else -1
+        satellites = gps.satellites_visible if (gps and gps.satellites_visible is not None) else 0
         
         if fix_type != self._prev_gps_fix:
             fix_names = {-1: "NO_GPS_OBJ", 0: "NO_GPS", 1: "NO_FIX", 2: "2D", 3: "3D", 4: "DGPS", 5: "RTK_FLT", 6: "RTK_FIX"}
@@ -892,16 +937,18 @@ class RadioStatusMonitor:
         gps = self.vehicle.gps_0
         
         # Compact status line with dummy thresholds (0.0V, -1 fix type)
-        batt_voltage = batt.voltage if (batt and batt.voltage) else 0.0
+        batt_voltage = batt.voltage if (batt and batt.voltage is not None) else 0.0
         batt_str = f"{batt_voltage:.1f}V" if batt_voltage > 0 else "?V"
         
-        fix_type = gps.fix_type if gps else -1
-        satellites = gps.satellites_visible if gps else 0
+        fix_type = gps.fix_type if (gps and gps.fix_type is not None) else -1
+        satellites = gps.satellites_visible if (gps and gps.satellites_visible is not None) else 0
         gps_str = f"{fix_type}({satellites})" if gps else "No GPS"
         
         alt_str = "?m"
         if self.vehicle.location.global_relative_frame:
-            alt_str = f"{self.vehicle.location.global_relative_frame.alt:.1f}m"
+            alt = self.vehicle.location.global_relative_frame.alt
+            if alt is not None:
+                alt_str = f"{alt:.1f}m"
         
         status = f"M:{self.vehicle.mode.name} A:{'Y' if self.vehicle.armed else 'N'} B:{batt_str} G:{gps_str} H:{alt_str}"
         self.telem.info(status)
