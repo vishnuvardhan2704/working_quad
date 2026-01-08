@@ -47,6 +47,7 @@ import time
 import argparse
 import serial
 import threading
+import queue
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -126,6 +127,12 @@ class MainController:
         self.vehicle = None
         self.radio = None
         self.running = False
+        
+        # Thread-safe radio communication
+        self.radio_lock = threading.Lock()  # Lock for serial port access
+        self.command_queue = queue.Queue()  # Queue for received commands
+        self.rx_abort_event = threading.Event()  # Signal to abort blocking operations
+        self.listener_thread = None  # Dedicated command listener thread
         
         # Mission state
         self.mission_running = False
@@ -284,16 +291,126 @@ class MainController:
             return False
     
     def send_response(self, msg):
-        """Send response to ground station with timestamp."""
+        """Send response to ground station with timestamp (thread-safe)."""
         try:
             # Add timestamp to message for sync verification
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
             response = f"[{timestamp}] [DRONE] {msg}\n"
-            self.radio.write(response.encode())
-            self.radio.flush()  # Ensure data is sent immediately
+            with self.radio_lock:  # Thread-safe write
+                self.radio.write(response.encode())
+                self.radio.flush()  # Ensure data is sent immediately
             self.log("info", f"[TX] {msg}")
         except Exception as e:
             self.log("error", f"Failed to send: {e}")
+    
+    def _handle_emergency_command(self, cmd):
+        """Handle emergency commands immediately (called from listener thread)."""
+        self.log("warning", f"EMERGENCY COMMAND RECEIVED: {cmd}")
+        
+        # Set abort event to interrupt blocking operations
+        self.rx_abort_event.set()
+        
+        # Also set the mission abort flag
+        with self.abort_lock:
+            self.abort_flag = True
+        
+        # Execute emergency action immediately
+        if cmd == "ABORT":
+            # Stop any running mission/detection
+            if self.detection_running:
+                self.detection_running = False
+            if NIDAR_AVAILABLE and self.safety_abort:
+                self.safety_abort.emergency_land()
+            else:
+                self.vehicle.mode = VehicleMode("LAND")
+            self.send_response("ABORT: Emergency landing!")
+            
+        elif cmd == "LAND":
+            if NIDAR_AVAILABLE and self.safety_abort:
+                self.safety_abort.emergency_land()
+            else:
+                self.vehicle.mode = VehicleMode("LAND")
+            self.send_response("LANDING...")
+            
+        elif cmd == "RTL":
+            if NIDAR_AVAILABLE and self.safety_abort:
+                self.safety_abort.return_to_launch()
+            else:
+                self.vehicle.mode = VehicleMode("RTL")
+            self.send_response("RTL: Returning to launch")
+            
+        elif cmd == "DISARM":
+            # Force disarm - this is critical for safety
+            self.vehicle.armed = False
+            self.send_response("DISARM COMMAND RECEIVED - disarming...")
+    
+    def _radio_listener_thread(self):
+        """
+        Dedicated thread that ALWAYS listens for commands.
+        
+        This thread runs independently of the main command processing loop,
+        ensuring that emergency commands (ABORT, LAND, RTL, DISARM) are
+        received even when the main thread is blocked in a takeoff/arm loop.
+        
+        Commands are either:
+        1. Handled immediately (emergency commands)
+        2. Queued for processing by main loop (normal commands)
+        """
+        buffer = ""
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        self.log("info", "Radio listener thread started - always listening for commands")
+        
+        while self.running:
+            try:
+                # Check for incoming data (non-blocking)
+                with self.radio_lock:
+                    if self.radio and self.radio.in_waiting > 0:
+                        data = self.radio.read(self.radio.in_waiting).decode('utf-8', errors='ignore')
+                    else:
+                        data = ""
+                
+                if data:
+                    buffer += data
+                    
+                    # Process complete commands (newline delimited)
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        cmd = line.strip().upper()
+                        
+                        if cmd:
+                            self.log("state", f"[RX] Command: {cmd}")
+                            
+                            # Emergency commands get IMMEDIATE handling
+                            if cmd in ['ABORT', 'LAND', 'RTL', 'DISARM']:
+                                self._handle_emergency_command(cmd)
+                            else:
+                                # Normal commands go to queue for main thread
+                                self.command_queue.put(cmd)
+                
+                consecutive_errors = 0
+                time.sleep(0.02)  # 20ms polling interval
+                
+            except OSError as e:
+                consecutive_errors += 1
+                self.log("error", f"Listener I/O error ({consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log("warning", "Too many errors - attempting reconnect from listener")
+                    if self.reconnect_radio():
+                        consecutive_errors = 0
+                        buffer = ""
+                    else:
+                        time.sleep(5)  # Wait before retry
+                else:
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                self.log("error", f"Listener error: {e}")
+                time.sleep(0.1)
+        
+        self.log("info", "Radio listener thread stopped")
     
     def execute_command(self, cmd):
         """Parse and execute received command."""
@@ -480,10 +597,13 @@ class MainController:
         self.send_response(result)
     
     def cmd_arm(self):
-        """Arm the drone with preflight checks."""
+        """Arm the drone with preflight checks (abort-aware)."""
         if self.vehicle.armed:
             self.send_response("Already armed")
             return
+        
+        # Clear abort event before starting
+        self.rx_abort_event.clear()
         
         # Set mode based on GPS
         gps = self.vehicle.gps_0
@@ -498,19 +618,26 @@ class MainController:
         timeout = 10
         start = time.time()
         while not self.vehicle.armed:
+            # Check for abort during arm wait
+            if self.rx_abort_event.is_set():
+                self.send_response("ARM CANCELLED: Emergency command received")
+                return
             if time.time() - start > timeout:
                 self.send_response("ARM FAILED: Timeout")
                 return
-            time.sleep(0.5)
+            time.sleep(0.2)  # Faster polling for better abort response
         
         self.log("success", "Vehicle ARMED")
         self.send_response(f"ARMED OK (mode={self.vehicle.mode.name})")
     
     def cmd_force_arm(self):
-        """Force arm the drone, bypassing ALL pre-arm checks."""
+        """Force arm the drone, bypassing ALL pre-arm checks (abort-aware)."""
         if self.vehicle.armed:
             self.send_response("Already armed")
             return
+        
+        # Clear abort event before starting
+        self.rx_abort_event.clear()
         
         self.log("warning", "FORCE ARM - bypassing pre-arm checks!")
         
@@ -540,10 +667,14 @@ class MainController:
         timeout = 10
         start = time.time()
         while not self.vehicle.armed:
+            # Check for abort during arm wait
+            if self.rx_abort_event.is_set():
+                self.send_response("FORCE ARM CANCELLED: Emergency command received")
+                return
             if time.time() - start > timeout:
                 self.send_response("FORCE ARM FAILED: Timeout")
                 return
-            time.sleep(0.5)
+            time.sleep(0.2)  # Faster polling for better abort response
         
         self.log("success", "Vehicle FORCE ARMED (checks bypassed)")
         self.send_response(f"FORCE ARMED OK (mode={self.vehicle.mode.name})")
@@ -568,10 +699,13 @@ class MainController:
         self.send_response("DISARMED OK")
     
     def cmd_takeoff(self, altitude):
-        """Takeoff to altitude."""
+        """Takeoff to altitude (abort-aware)."""
         if not self.vehicle.armed:
             self.send_response("ERROR: Not armed")
             return
+        
+        # Clear abort event before starting
+        self.rx_abort_event.clear()
         
         if self.vehicle.mode.name != "GUIDED":
             self.vehicle.mode = VehicleMode("GUIDED")
@@ -584,6 +718,13 @@ class MainController:
         timeout = 30
         start = time.time()
         while True:
+            # CHECK FOR ABORT - this is the critical fix!
+            if self.rx_abort_event.is_set():
+                self.log("warning", "TAKEOFF ABORTED by emergency command!")
+                self.send_response("TAKEOFF ABORTED - emergency command received")
+                # Don't change mode here - the emergency handler already did
+                return
+            
             current_alt = self.vehicle.location.global_relative_frame.alt or 0
             if current_alt >= altitude * 0.95:
                 self.send_response(f"TAKEOFF OK: {current_alt:.1f}m")
@@ -591,7 +732,7 @@ class MainController:
             if time.time() - start > timeout:
                 self.send_response(f"TAKEOFF: At {current_alt:.1f}m (timeout)")
                 break
-            time.sleep(1)
+            time.sleep(0.3)  # Faster polling (was 1s) for better abort response
     
     def cmd_land(self):
         """Land immediately."""
@@ -1671,9 +1812,13 @@ class MainController:
         return False
     
     def listen_loop(self):
-        """Main loop - listen for commands."""
-        self.log("header", "LISTENING FOR COMMANDS")
-        self.log("info", "Waiting for commands from ground station...")
+        """Main command processing loop - processes commands from queue.
+        
+        The actual radio reading is done by _radio_listener_thread.
+        This loop just processes queued commands.
+        """
+        self.log("header", "COMMAND PROCESSOR READY")
+        self.log("info", "Radio listener thread active - always monitoring for commands")
         self.log("info", "Scout: SCOUT (auto-starts detection+recording), SCOUT:STOP")
         self.log("info", "Waypoints: WP:lat,lon,alt, WP:CLEAR, WP:LIST")
         self.log("info", "Flight: ARM, FORCEARM, TAKEOFF:x, LAND, RTL, ABORT")
@@ -1683,51 +1828,23 @@ class MainController:
         detection_status = "available" if DETECTION_AVAILABLE else "not available"
         self.send_response(f"DRONE READY - Detection {detection_status}")
         
-        buffer = ""
-        consecutive_errors = 0
-        max_consecutive_errors = 5  # Trigger reconnect after 5 consecutive errors
-        
         while self.running:
             try:
-                if self.radio.in_waiting > 0:
-                    data = self.radio.read(self.radio.in_waiting).decode('utf-8', errors='ignore')
-                    buffer += data
-                    
-                    while '\n' in buffer:
-                        cmd, buffer = buffer.split('\n', 1)
-                        cmd = cmd.strip()
-                        if cmd:
-                            self.execute_command(cmd)
+                # Get command from queue (with timeout to allow checking self.running)
+                try:
+                    cmd = self.command_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 
-                consecutive_errors = 0  # Reset on success
-                time.sleep(0.05)
+                # Process the command
+                self.execute_command(cmd)
                 
             except KeyboardInterrupt:
                 self.log("info", "Stopping...")
                 break
-            except OSError as e:
-                # I/O errors (errno 5) indicate radio disconnection
-                consecutive_errors += 1
-                self.log("error", f"Radio I/O error ({consecutive_errors}/{max_consecutive_errors}): {e}")
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    self.log("warning", "Too many consecutive errors - radio likely disconnected")
-                    if self.reconnect_radio():
-                        consecutive_errors = 0
-                        buffer = ""  # Clear buffer after reconnect
-                        self.send_response("DRONE RECONNECTED")
-                    else:
-                        self.log("error", "Radio reconnection failed - continuing without radio")
-                        # Keep trying periodically
-                        time.sleep(10)
-                        if self.reconnect_radio():
-                            consecutive_errors = 0
-                            buffer = ""
-                else:
-                    time.sleep(1)
             except Exception as e:
-                self.log("error", f"Error: {e}")
-                time.sleep(1)
+                self.log("error", f"Command processing error: {e}")
+                time.sleep(0.1)
     
     def run(self):
         """Start the main controller."""
@@ -1759,6 +1876,16 @@ class MainController:
         
         try:
             if radio_connected:
+                # Start the dedicated radio listener thread
+                self.listener_thread = threading.Thread(
+                    target=self._radio_listener_thread,
+                    daemon=True,
+                    name="RadioListener"
+                )
+                self.listener_thread.start()
+                self.log("success", "Radio listener thread started - emergency commands always monitored")
+                
+                # Run main command processing loop
                 self.listen_loop()
             else:
                 # No radio - just keep running for testing
@@ -1768,6 +1895,11 @@ class MainController:
                     time.sleep(1)
         finally:
             self.running = False
+            
+            # Wait for listener thread to stop
+            if self.listener_thread and self.listener_thread.is_alive():
+                self.log("info", "Waiting for listener thread to stop...")
+                self.listener_thread.join(timeout=2.0)
             
             # Stop detection if running
             if self.detection_running:

@@ -33,6 +33,8 @@ import time
 import argparse
 import serial
 import threading
+import os
+from datetime import datetime
 
 
 class DroneCommandSender:
@@ -45,6 +47,39 @@ class DroneCommandSender:
         self.running = False
         self.receive_thread = None
         
+        # Telemetry logging
+        self.telemetry_log_file = None
+        self.setup_telemetry_logging()
+        
+    def setup_telemetry_logging(self):
+        """Setup telemetry log file."""
+        try:
+            # Create logs directory if it doesn't exist
+            log_dir = "/home/dart/quadtest/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # Create timestamped log file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(log_dir, f"tx_telemetry_{timestamp}.log")
+            self.telemetry_log_file = open(log_path, 'w')
+            self.telemetry_log_file.write(f"TX Telemetry Log - Started at {datetime.now()}\n")
+            self.telemetry_log_file.write("=" * 80 + "\n")
+            self.telemetry_log_file.flush()
+            print(f"[INFO] Logging telemetry to: {log_path}")
+        except Exception as e:
+            print(f"[WARN] Could not setup telemetry logging: {e}")
+            self.telemetry_log_file = None
+    
+    def log_telemetry(self, data):
+        """Log telemetry data to file."""
+        if self.telemetry_log_file:
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                self.telemetry_log_file.write(f"[{timestamp}] {data}\n")
+                self.telemetry_log_file.flush()
+            except Exception as e:
+                pass  # Silently ignore logging errors
+    
     def connect(self):
         """Connect to 3DR radio."""
         print(f"[INFO] Connecting to radio on {self.port} @ {self.baud}...")
@@ -82,6 +117,9 @@ class DroneCommandSender:
     
     def _display_response(self, data):
         """Format and display received response."""
+        # Log all data to file
+        self.log_telemetry(data)
+        
         # ACK responses (PONG, OK, etc)
         if "PONG" in data:
             print(f"\n  ✅ \033[92m{data}\033[0m")  # Green for ACK
@@ -93,8 +131,13 @@ class DroneCommandSender:
             print(f"\n  🛫 {data}")
         # Telemetry messages from drone
         elif "[TELEM]" in data:
+            # Extract and format telemetry data for better readability
+            # Parse telemetry values
+            if "Mode:" in data and "Bat:" in data:
+                # This is our enhanced telemetry with all values
+                print(f"\n  📡 \033[96m{data}\033[0m")  # Cyan
             # Color-code telemetry by severity
-            if "[ERROR]" in data or "[CRIT]" in data or "[EMERG]" in data:
+            elif "[ERROR]" in data or "[CRIT]" in data or "[EMERG]" in data:
                 print(f"\n  ❌ \033[91m{data}\033[0m")  # Red
             elif "[WARN]" in data:
                 print(f"\n  ⚠️  \033[93m{data}\033[0m")  # Yellow
@@ -176,6 +219,9 @@ class DroneCommandSender:
         self.running = False
         if self.serial:
             self.serial.close()
+        if self.telemetry_log_file:
+            self.telemetry_log_file.write(f"\n\nLog ended at {datetime.now()}\n")
+            self.telemetry_log_file.close()
         print("[INFO] Disconnected")
     
     def show_help(self):

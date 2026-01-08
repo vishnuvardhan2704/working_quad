@@ -46,6 +46,7 @@ import argparse
 import serial
 import threading
 from datetime import datetime
+import math  # For coordinate calculations
 
 # Add nidar/ to path for importing modules
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +94,46 @@ class DroneCommandReceiver:
         # Safety modules (initialized after connection)
         self.preflight = None
         self.safety_abort = None
+        
+        # Telemetry streaming thread
+        self.telemetry_thread = None
+        self.telemetry_interval = 2.0  # Send telemetry every 2 seconds
+        
+        # Telemetry logging
+        self.telemetry_log_file = None
+        self.setup_telemetry_logging()
+    
+    def setup_telemetry_logging(self):
+        """Setup telemetry log file."""
+        try:
+            # Create logs directory if it doesn't exist
+            log_dir = "/home/dart/quadtest/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # Create timestamped log file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(log_dir, f"rx_telemetry_{timestamp}.log")
+            self.telemetry_log_file = open(log_path, 'w')
+            self.telemetry_log_file.write(f"RX Telemetry Log - Started at {datetime.now()}\n")
+            self.telemetry_log_file.write("=" * 80 + "\n")
+            self.telemetry_log_file.write("Timestamp | Mode | Armed | Alt | Voltage | Current | % | GPS Fix | Sats | HDOP | GyroX | GyroY | GyroZ | VibeX | VibeY | VibeZ | RSSI\n")
+            self.telemetry_log_file.write("=" * 80 + "\n")
+            self.telemetry_log_file.flush()
+            print(f"[INFO] Logging telemetry to: {log_path}")
+        except Exception as e:
+            print(f"[WARN] Could not setup telemetry logging: {e}")
+            self.telemetry_log_file = None
+    
+    def log_telemetry_to_file(self, mode, armed, alt, voltage, current, level, gps_fix, sats, hdop, gx, gy, gz, vx, vy, vz, rssi):
+        """Log telemetry data to CSV-style file."""
+        if self.telemetry_log_file:
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                line = f"{timestamp} | {mode} | {armed} | {alt:.1f} | {voltage:.2f} | {current:.1f} | {level} | {gps_fix} | {sats} | {hdop:.1f} | {gx:.2f} | {gy:.2f} | {gz:.2f} | {vx:.2f} | {vy:.2f} | {vz:.2f} | {rssi}\n"
+                self.telemetry_log_file.write(line)
+                self.telemetry_log_file.flush()
+            except Exception as e:
+                pass  # Silently ignore logging errors
         
     def log(self, level, msg):
         """Log message using MissionLogger if available, else print."""
@@ -156,6 +197,90 @@ class DroneCommandReceiver:
             self.log("info", f"[TX] {msg}")
         except Exception as e:
             self.log("error", f"Failed to send response: {e}")
+    
+    def send_telemetry(self, msg):
+        """Send telemetry data via radio (tagged with [TELEM])."""
+        try:
+            response = f"[TELEM][INFO] {msg}\n"
+            self.radio.write(response.encode())
+        except Exception as e:
+            pass  # Don't spam logs with telemetry send errors
+    
+    def telemetry_loop(self):
+        """Background thread that continuously sends telemetry data."""
+        while self.running:
+            try:
+                if self.vehicle and self.radio:
+                    # Get all telemetry values
+                    mode = self.vehicle.mode.name
+                    armed = "ARM" if self.vehicle.armed else "DISARM"
+                    
+                    # Altitude
+                    alt = self.vehicle.location.global_relative_frame.alt or 0
+                    
+                    # Battery
+                    bat = self.vehicle.battery
+                    voltage = bat.voltage if (bat and bat.voltage) else 0
+                    current = bat.current if (bat and bat.current) else 0
+                    level = bat.level if (bat and bat.level) else 0
+                    
+                    # GPS
+                    gps = self.vehicle.gps_0
+                    gps_fix = gps.fix_type if gps else 0
+                    satellites = gps.satellites_visible if gps else 0
+                    hdop = gps.eph if gps else 9999  # HDOP (horizontal dilution of precision)
+                    
+                    # IMU - Gyro
+                    # Access raw IMU data from vehicle parameters
+                    try:
+                        # DroneKit doesn't directly expose gyro, so we use attitude velocities
+                        gyro_x = self.vehicle.attitude.roll if hasattr(self.vehicle.attitude, 'roll') else 0
+                        gyro_y = self.vehicle.attitude.pitch if hasattr(self.vehicle.attitude, 'pitch') else 0
+                        gyro_z = self.vehicle.attitude.yaw if hasattr(self.vehicle.attitude, 'yaw') else 0
+                    except:
+                        gyro_x = gyro_y = gyro_z = 0
+                    
+                    # Vibration - Access via vehicle.parameters or raw_imu
+                    try:
+                        # Try to get vibration data from vehicle
+                        vibe_x = self.vehicle.vibration.vibration_x if hasattr(self.vehicle, 'vibration') else 0
+                        vibe_y = self.vehicle.vibration.vibration_y if hasattr(self.vehicle, 'vibration') else 0
+                        vibe_z = self.vehicle.vibration.vibration_z if hasattr(self.vehicle, 'vibration') else 0
+                    except:
+                        vibe_x = vibe_y = vibe_z = 0
+                    
+                    # RSSI - Radio Signal Strength
+                    try:
+                        rssi = self.vehicle.parameters.get('RSSI', 0)
+                    except:
+                        rssi = 0
+                    
+                    # Log to file
+                    self.log_telemetry_to_file(
+                        mode, armed, alt, voltage, current, level,
+                        gps_fix, satellites, hdop,
+                        gyro_x, gyro_y, gyro_z,
+                        vibe_x, vibe_y, vibe_z,
+                        rssi
+                    )
+                    
+                    # Send compact telemetry message
+                    telem_msg = (
+                        f"Mode:{mode} {armed} | "
+                        f"Alt:{alt:.1f}m | "
+                        f"Bat:{voltage:.2f}V {current:.1f}A {level}% | "
+                        f"GPS:Fix{gps_fix} Sat{satellites} HDOP:{hdop:.1f} | "
+                        f"Gyro:X{gyro_x:.2f} Y{gyro_y:.2f} Z{gyro_z:.2f} | "
+                        f"Vibe:X{vibe_x:.2f} Y{vibe_y:.2f} Z{vibe_z:.2f} | "
+                        f"RSSI:{rssi}"
+                    )
+                    self.send_telemetry(telem_msg)
+                    
+            except Exception as e:
+                pass  # Don't spam errors in telemetry thread
+            
+            time.sleep(self.telemetry_interval)
+
     
     def execute_command(self, cmd):
         """Parse and execute a command."""
@@ -456,14 +581,53 @@ class DroneCommandReceiver:
         self.send_response(f"STOP: Mode={self.vehicle.mode.name}")
     
     def cmd_status(self):
-        """Send current status."""
+        """Send current status with enhanced telemetry."""
         mode = self.vehicle.mode.name
         armed = "ARM" if self.vehicle.armed else "DISARM"
         alt = self.vehicle.location.global_relative_frame.alt or 0
-        bat = self.vehicle.battery.voltage if self.vehicle.battery else 0
-        gps = self.vehicle.gps_0.fix_type if self.vehicle.gps_0 else 0
         
-        status = f"STATUS: {mode},{armed},ALT={alt:.1f}m,BAT={bat:.1f}V,GPS={gps}"
+        # Battery
+        bat = self.vehicle.battery
+        voltage = bat.voltage if (bat and bat.voltage) else 0
+        current = bat.current if (bat and bat.current) else 0
+        level = bat.level if (bat and bat.level) else 0
+        
+        # GPS
+        gps = self.vehicle.gps_0
+        gps_fix = gps.fix_type if gps else 0
+        satellites = gps.satellites_visible if gps else 0
+        hdop = gps.eph if gps else 9999
+        
+        # IMU/Gyro (using attitude as proxy)
+        try:
+            gyro_x = self.vehicle.attitude.roll if hasattr(self.vehicle.attitude, 'roll') else 0
+            gyro_y = self.vehicle.attitude.pitch if hasattr(self.vehicle.attitude, 'pitch') else 0
+            gyro_z = self.vehicle.attitude.yaw if hasattr(self.vehicle.attitude, 'yaw') else 0
+        except:
+            gyro_x = gyro_y = gyro_z = 0
+        
+        # Vibration
+        try:
+            vibe_x = self.vehicle.vibration.vibration_x if hasattr(self.vehicle, 'vibration') else 0
+            vibe_y = self.vehicle.vibration.vibration_y if hasattr(self.vehicle, 'vibration') else 0
+            vibe_z = self.vehicle.vibration.vibration_z if hasattr(self.vehicle, 'vibration') else 0
+        except:
+            vibe_x = vibe_y = vibe_z = 0
+        
+        # RSSI
+        try:
+            rssi = self.vehicle.parameters.get('RSSI', 0)
+        except:
+            rssi = 0
+        
+        status = (
+            f"STATUS: {mode},{armed},ALT={alt:.1f}m | "
+            f"BAT={voltage:.2f}V,{current:.1f}A,{level}% | "
+            f"GPS=Fix{gps_fix},Sat{satellites},HDOP{hdop:.1f} | "
+            f"GYRO=X{gyro_x:.2f},Y{gyro_y:.2f},Z{gyro_z:.2f} | "
+            f"VIBE=X{vibe_x:.2f},Y{vibe_y:.2f},Z{vibe_z:.2f} | "
+            f"RSSI={rssi}"
+        )
         self.send_response(status)
     
     def cmd_kml_survey(self, kml_filename, altitude):
@@ -577,6 +741,11 @@ class DroneCommandReceiver:
         
         self.running = True
         
+        # Start telemetry streaming thread
+        self.telemetry_thread = threading.Thread(target=self.telemetry_loop, daemon=True)
+        self.telemetry_thread.start()
+        self.log("success", "Telemetry streaming started (2s interval)")
+        
         # Show integration status
         if NIDAR_AVAILABLE:
             self.log("success", "Integrated with nidar/ modules:")
@@ -597,6 +766,9 @@ class DroneCommandReceiver:
                 self.vehicle.close()
             if self.radio:
                 self.radio.close()
+            if self.telemetry_log_file:
+                self.telemetry_log_file.write(f"\n\nLog ended at {datetime.now()}\n")
+                self.telemetry_log_file.close()
             self.log("info", "Connections closed")
         
         return True
