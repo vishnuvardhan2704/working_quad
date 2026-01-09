@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Drone Command Receiver via LoRa/3DR Radio (BASIC VERSION)
+VTOL Command Receiver via LoRa/3DR Radio (BASIC VERSION)
 
 NOTE: For human detection and autonomous scouting missions, use main.py instead!
       main.py has DETECT:START, MISSION:START, and human detection features.
@@ -9,20 +9,28 @@ NOTE: For human detection and autonomous scouting missions, use main.py instead!
 Listens for commands from another laptop via 3DR radio and executes them on the Pixhawk.
 INTEGRATED with nidar/ modules for safety checks and proper logging.
 
+VTOL Configuration:
+    - 4 lift motors (quad configuration for vertical flight)
+    - 1 pusher motor (forward thrust)
+    - Servo-controlled rudder/elevons
+    - Pixhawk with fmuv2 QuadPlane firmware
+
 Commands Supported:
-    ARM           - Arm the drone (with preflight checks)
-    DISARM        - Disarm the drone
-    TAKEOFF:5     - Takeoff to 5 meters
-    LAND          - Land the drone (emergency land)
-    RTL           - Return to launch
-    MODE:STABILIZE - Change flight mode
-    MODE:LOITER   - Change to loiter mode
-    MODE:GUIDED   - Change to guided mode
+    ARM           - Arm the VTOL (with preflight checks)
+    DISARM        - Disarm the VTOL
+    TAKEOFF:5     - Takeoff to 5 meters (VTOL vertical)
+    LAND          - Land the VTOL (QLAND - vertical landing)
+    RTL           - Return to launch (QRTL - vertical RTL)
+    MODE:QLOITER  - VTOL hover/loiter mode
+    MODE:QHOVER   - VTOL hover mode
+    MODE:GUIDED   - Guided mode
+    MODE:FBWA     - Fixed-wing fly-by-wire A
+    MODE:CRUISE   - Fixed-wing cruise
     GOTO:lat,lon,alt - Go to GPS location
     MOVE:n,e,d    - Move relative (north, east, down in meters)
-    STOP          - Stop and hover (BRAKE mode)
+    STOP          - Stop and hover (QLOITER mode)
     PREFLIGHT     - Run preflight checks only
-    ABORT         - Emergency abort (immediate land)
+    ABORT         - Emergency abort (QLAND)
     SCOUT         - Start KML area survey mission (uses default config)
     KML:SURVEY:filename,altitude - Custom KML survey with specific file
     
@@ -57,6 +65,9 @@ sys.path.insert(0, NIDAR_DIR)
 DEFAULT_KML_FILE = "survey_area.kml"  # Filename in /home/dart/quadtest/missions/
 DEFAULT_SCOUT_ALTITUDE = 5.0  # meters AGL
 DEFAULT_SCOUT_PATTERN = "curved"  # "curved" or "lawnmower"
+
+# VTOL Configuration - must match main.py
+IS_VTOL = True  # Set to True for QuadPlane VTOL, False for standard quadcopter
 
 try:
     from dronekit import connect, VehicleMode, LocationGlobalRelative
@@ -107,7 +118,8 @@ class DroneCommandReceiver:
         """Setup telemetry log file."""
         try:
             # Create logs directory if it doesn't exist
-            log_dir = "/home/dart/quadtest/logs"
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_dir = os.path.join(script_dir, "logs")
             os.makedirs(log_dir, exist_ok=True)
             
             # Create timestamped log file
@@ -471,32 +483,35 @@ class DroneCommandReceiver:
             time.sleep(1)
     
     def cmd_land(self):
-        """Land the drone using SafetyAbort if available."""
+        """Land the VTOL using QLAND (vertical landing)."""
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.emergency_land()
-            self.send_response("LANDING (SafetyAbort)...")
+            self.send_response(f"{'QLAND' if IS_VTOL else 'LAND'}: Vertical landing...")
         else:
-            self.vehicle.mode = VehicleMode("LAND")
-            self.send_response("LANDING...")
+            land_mode = "QLAND" if IS_VTOL else "LAND"
+            self.vehicle.mode = VehicleMode(land_mode)
+            self.send_response(f"{land_mode}: Vertical landing...")
     
     def cmd_rtl(self):
-        """Return to launch using SafetyAbort if available."""
+        """Return to launch using QRTL (vertical RTL)."""
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.return_to_launch()
-            self.send_response("RTL (SafetyAbort): Returning to launch")
+            self.send_response(f"{'QRTL' if IS_VTOL else 'RTL'}: Returning to launch")
         else:
-            self.vehicle.mode = VehicleMode("RTL")
-            self.send_response("RTL: Returning to launch")
+            rtl_mode = "QRTL" if IS_VTOL else "RTL"
+            self.vehicle.mode = VehicleMode(rtl_mode)
+            self.send_response(f"{rtl_mode}: Returning to launch")
     
     def cmd_abort(self):
-        """Emergency abort - immediate land."""
+        """Emergency abort - immediate QLAND (vertical landing)."""
         self.log("warning", "EMERGENCY ABORT TRIGGERED")
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.emergency_land()
-            self.send_response("ABORT: Emergency landing!")
+            self.send_response(f"ABORT: Emergency {'QLAND' if IS_VTOL else 'LAND'}!")
         else:
-            self.vehicle.mode = VehicleMode("LAND")
-            self.send_response("ABORT: Emergency landing!")
+            land_mode = "QLAND" if IS_VTOL else "LAND"
+            self.vehicle.mode = VehicleMode(land_mode)
+            self.send_response(f"ABORT: Emergency {land_mode}!")
     
     def cmd_preflight(self):
         """Run preflight checks only."""
@@ -572,12 +587,16 @@ class DroneCommandReceiver:
         self.send_response(f"MOVE: N={north}m E={east}m D={down}m")
     
     def cmd_stop(self):
-        """Stop and hover."""
-        # Try BRAKE mode first, fall back to LOITER
-        try:
-            self.vehicle.mode = VehicleMode("BRAKE")
-        except:
-            self.vehicle.mode = VehicleMode("LOITER")
+        """Stop and hover using QLOITER for VTOL."""
+        if IS_VTOL:
+            # VTOL: Use QLOITER for hover
+            self.vehicle.mode = VehicleMode("QLOITER")
+        else:
+            # Try BRAKE mode first, fall back to LOITER
+            try:
+                self.vehicle.mode = VehicleMode("BRAKE")
+            except:
+                self.vehicle.mode = VehicleMode("LOITER")
         self.send_response(f"STOP: Mode={self.vehicle.mode.name}")
     
     def cmd_status(self):
@@ -650,8 +669,9 @@ class DroneCommandReceiver:
             from mission.kml_loader import load_waypoints_from_kml, validate_kml_mission
             from mission.waypoint_mission import WaypointMission
             
-            # Build KML file path
-            kml_path = os.path.join("/home/dart/quadtest/missions", kml_filename)
+            # Build KML file path (relative to script location)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            kml_path = os.path.join(script_dir, "missions", kml_filename)
             if not os.path.exists(kml_path):
                 self.send_response(f"ERROR: KML file not found: {kml_path}")
                 return

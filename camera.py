@@ -34,7 +34,7 @@ parser.add_argument("--show-fps", action="store_true",
 parser.add_argument("--skip", type=int, default=3,
                     help="Process every Nth frame (3 = process 1 out of 3 frames)")
 parser.add_argument("--model", type=str, 
-                    default="/home/dart/quadtest/best.onnx",
+                    default="/home/dart2/duplicate_scout_drone/working_quad/best.onnx",
                     help="Path to ONNX model")
 parser.add_argument("--no-realsense", action="store_true",
                     help="Force OpenCV camera instead of RealSense SDK")

@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-Drone Command Sender via LoRa/3DR Radio
+VTOL Command Sender via LoRa/3DR Radio
 
-Send commands to drone from laptop via 3DR radio.
+Send commands to VTOL aircraft from laptop via 3DR radio.
 This script runs on the REMOTE laptop (ground station).
 
+VTOL Configuration:
+    - 4 lift motors (quad configuration for vertical flight)
+    - 1 pusher motor (forward thrust)
+    - Servo-controlled rudder/elevons
+    - Pixhawk with fmuv2 QuadPlane firmware
+
 Commands:
-    ARM           - Arm the drone
-    DISARM        - Disarm the drone
-    TAKEOFF:5     - Takeoff to 5 meters
-    LAND          - Land the drone
-    RTL           - Return to launch
+    ARM           - Arm the VTOL
+    DISARM        - Disarm the VTOL
+    TAKEOFF:5     - Takeoff to 5 meters (VTOL vertical)
+    LAND          - Land the VTOL (QLAND - vertical landing)
+    RTL           - Return to launch (QRTL - vertical RTL)
     SCOUT         - Start KML area survey mission (human detection)
     KML:SURVEY:file,alt - Custom KML survey (e.g. KML:SURVEY:area.kml,20)
-    MODE:STABILIZE - Change to stabilize mode
-    MODE:LOITER   - Change to loiter mode
-    MODE:GUIDED   - Change to guided mode
+    MODE:QLOITER  - VTOL hover/loiter mode
+    MODE:QHOVER   - VTOL hover mode  
+    MODE:GUIDED   - Guided mode
+    MODE:FBWA     - Fixed-wing fly-by-wire A
+    MODE:CRUISE   - Fixed-wing cruise mode
     MODE:AUTO     - Start uploaded mission (after SCOUT/KML:SURVEY)
     GOTO:lat,lon,alt - Go to GPS location
-    STATUS        - Get drone status
-    ABORT         - Emergency abort
+    STATUS        - Get VTOL status
+    ABORT         - Emergency abort (QLAND)
     PING          - Test connection
     
 Usage:
@@ -55,7 +63,8 @@ class DroneCommandSender:
         """Setup telemetry log file."""
         try:
             # Create logs directory if it doesn't exist
-            log_dir = "/home/dart/quadtest/logs"
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_dir = os.path.join(script_dir, "logs")
             os.makedirs(log_dir, exist_ok=True)
             
             # Create timestamped log file
@@ -232,11 +241,11 @@ Commands:
   SCOUT            - Start detection + recording (auto!)
   SCOUT:STOP       - Stop everything and save video
   
-  === FULL FLIGHT SEQUENCE ===
-  1. ARM              - Arm the drone
-  2. TAKEOFF:10       - Takeoff to 10 meters
+  === FULL FLIGHT SEQUENCE (VTOL) ===
+  1. ARM              - Arm the VTOL
+  2. TAKEOFF:10       - Takeoff to 10 meters (VTOL vertical)
   3. SCOUT            - Auto-starts detection + recording
-  4. RTL              - Return home after scouting
+  4. RTL              - Return home (QRTL - vertical landing)
   5. SCOUT:STOP       - Stop and save recording
   
   === WITH WAYPOINTS (optional) ===
@@ -246,14 +255,23 @@ Commands:
   ALT:15           - Set default altitude (meters)
   Then: SCOUT      - Flies waypoints with detection
   
-  === FLIGHT COMMANDS ===
+  === VTOL FLIGHT COMMANDS ===
   ARM              - Arm motors
   DISARM           - Disarm motors
-  TAKEOFF:10       - Takeoff to 10 meters
-  LAND             - Land immediately
-  RTL              - Return to launch
+  TAKEOFF:10       - Takeoff to 10 meters (vertical)
+  LAND             - Land immediately (QLAND - vertical)
+  RTL              - Return to launch (QRTL - vertical)
   GOTO:lat,lon,alt - Go to single location
-  ABORT            - Emergency stop
+  ABORT            - Emergency stop (QLAND)
+  STOP             - Hover in place (QLOITER)
+  
+  === VTOL MODE COMMANDS ===
+  MODE:QLOITER     - VTOL hover/loiter mode
+  MODE:QHOVER      - VTOL hover mode
+  MODE:GUIDED      - Guided mode
+  MODE:FBWA        - Fixed-wing fly-by-wire A
+  MODE:CRUISE      - Fixed-wing cruise mode
+  MODE:AUTO        - Start uploaded mission
   
   === DETECTION (manual control) ===
   DETECT:START     - Start camera + detection (no recording)
@@ -262,9 +280,8 @@ Commands:
   DETECT:CONF:0.7  - Set confidence (0.1-1.0)
   
   === OTHER ===
-  STATUS           - Get drone status
+  STATUS           - Get VTOL status
   PING             - Test connection
-  MODE:GUIDED      - Set guided mode
   QUIT             - Exit program
 
   === TELEMETRY ===

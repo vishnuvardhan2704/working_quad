@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Main Autonomous Drone Controller with LoRa Command Interface and Human Detection
+Main Autonomous VTOL (QuadPlane) Controller with LoRa Command Interface and Human Detection
 
-This is the main entry point that:
+This is the main entry point for VTOL aircraft (QuadPlane with fmuv2 firmware) that:
 1. Listens for commands from ground station via LoRa/3DR radio
 2. Executes preflight checks
-3. Runs waypoint missions
+3. Runs waypoint missions in VTOL mode
 4. Supports KML file import for mission planning
 5. Performs real-time human detection using YOLOv8 ONNX model
+
+VTOL Configuration:
+    - 4 lift motors (quad configuration for vertical flight)
+    - 1 pusher motor (forward thrust)
+    - Servo-controlled rudder/elevons
+    - Pixhawk with fmuv2 QuadPlane firmware
 
 Commands received from ground station (tx_commands.py):
     PING              - Test connection
@@ -16,16 +22,24 @@ Commands received from ground station (tx_commands.py):
     ARM               - Arm the drone
     FORCEARM          - Force arm (bypass pre-arm checks)
     DISARM            - Disarm the drone
-    TAKEOFF:5         - Takeoff to 5 meters
-    LAND              - Land immediately
-    RTL               - Return to launch
-    ABORT             - Emergency abort
+    TAKEOFF:5         - Takeoff to 5 meters (VTOL vertical)
+    LAND              - Land immediately (QLAND - vertical landing)
+    RTL               - Return to launch (QRTL - vertical RTL)
+    ABORT             - Emergency abort (QLAND)
     MISSION:START     - Start the autonomous mission
     MISSION:STOP      - Stop current mission
-    MODE:xxx          - Change flight mode
+    MODE:xxx          - Change flight mode (supports VTOL modes)
     LOAD:filename     - Load KML mission file
     
-    Human Detection  Commands:
+    VTOL-Specific Modes:
+    MODE:QLOITER      - VTOL hover/loiter
+    MODE:QHOVER       - VTOL hover
+    MODE:QLAND        - VTOL vertical landing
+    MODE:QRTL         - VTOL return to launch
+    MODE:FBWA         - Fixed-wing fly-by-wire A
+    MODE:CRUISE       - Fixed-wing cruise
+    
+    Human Detection Commands:
     DETECT:START      - Start human detection camera
     DETECT:STOP       - Stop human detection
     DETECT:STATUS     - Get current detection status
@@ -109,6 +123,11 @@ except ImportError as e:
 
 # Global constants - change these values to modify drone behavior
 SCOUT_ALTITUDE = 5.0  # Default altitude for all scouting missions (meters AGL)
+
+# VTOL Configuration - This code is designed for QuadPlane VTOL aircraft
+# Uses QLAND/QRTL for vertical landing/RTL instead of fixed-wing LAND/RTL
+IS_VTOL = True  # Set to True for QuadPlane VTOL, False for standard quadcopter
+VTOL_TRANSITION_ALTITUDE = 15.0  # Minimum altitude for fixed-wing transition (meters)
 
 
 class MainController:
@@ -315,6 +334,7 @@ class MainController:
             self.abort_flag = True
         
         # Execute emergency action immediately
+        # VTOL uses QLAND/QRTL for vertical landing/RTL
         if cmd == "ABORT":
             # Stop any running mission/detection
             if self.detection_running:
@@ -322,22 +342,28 @@ class MainController:
             if NIDAR_AVAILABLE and self.safety_abort:
                 self.safety_abort.emergency_land()
             else:
-                self.vehicle.mode = VehicleMode("LAND")
-            self.send_response("ABORT: Emergency landing!")
+                # VTOL: Use QLAND for vertical landing
+                land_mode = "QLAND" if IS_VTOL else "LAND"
+                self.vehicle.mode = VehicleMode(land_mode)
+            self.send_response(f"ABORT: Emergency {'QLAND' if IS_VTOL else 'LAND'}!")
             
         elif cmd == "LAND":
             if NIDAR_AVAILABLE and self.safety_abort:
                 self.safety_abort.emergency_land()
             else:
-                self.vehicle.mode = VehicleMode("LAND")
-            self.send_response("LANDING...")
+                # VTOL: Use QLAND for vertical landing
+                land_mode = "QLAND" if IS_VTOL else "LAND"
+                self.vehicle.mode = VehicleMode(land_mode)
+            self.send_response(f"{'QLAND' if IS_VTOL else 'LAND'}: Vertical landing...")
             
         elif cmd == "RTL":
             if NIDAR_AVAILABLE and self.safety_abort:
                 self.safety_abort.return_to_launch()
             else:
-                self.vehicle.mode = VehicleMode("RTL")
-            self.send_response("RTL: Returning to launch")
+                # VTOL: Use QRTL for vertical return to launch
+                rtl_mode = "QRTL" if IS_VTOL else "RTL"
+                self.vehicle.mode = VehicleMode(rtl_mode)
+            self.send_response(f"{'QRTL' if IS_VTOL else 'RTL'}: Returning to launch")
             
         elif cmd == "DISARM":
             # Force disarm - this is critical for safety
@@ -540,6 +566,49 @@ class MainController:
             elif cmd == "SCOUT:STOP":
                 self.cmd_scout_stop()
             
+            # VTOL-Specific Commands
+            elif cmd == "QLOITER":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("QLOITER")
+                    self.send_response("QLOITER: VTOL hover mode")
+                else:
+                    self.send_response("ERROR: QLOITER only available on VTOL")
+            
+            elif cmd == "QLAND":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("QLAND")
+                    self.send_response("QLAND: VTOL vertical landing")
+                else:
+                    self.send_response("ERROR: QLAND only available on VTOL")
+            
+            elif cmd == "QRTL":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("QRTL")
+                    self.send_response("QRTL: VTOL vertical return to launch")
+                else:
+                    self.send_response("ERROR: QRTL only available on VTOL")
+            
+            elif cmd == "QHOVER":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("QHOVER")
+                    self.send_response("QHOVER: VTOL hover mode")
+                else:
+                    self.send_response("ERROR: QHOVER only available on VTOL")
+            
+            elif cmd == "CRUISE":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("CRUISE")
+                    self.send_response("CRUISE: Fixed-wing cruise mode")
+                else:
+                    self.send_response("ERROR: CRUISE only available on VTOL")
+            
+            elif cmd == "FBWA":
+                if IS_VTOL:
+                    self.vehicle.mode = VehicleMode("FBWA")
+                    self.send_response("FBWA: Fixed-wing fly-by-wire A mode")
+                else:
+                    self.send_response("ERROR: FBWA only available on VTOL")
+            
             # Unknown
             else:
                 self.send_response(f"ERROR: Unknown command '{cmd}'")
@@ -735,23 +804,27 @@ class MainController:
             time.sleep(0.3)  # Faster polling (was 1s) for better abort response
     
     def cmd_land(self):
-        """Land immediately."""
+        """Land immediately using VTOL vertical landing (QLAND)."""
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.emergency_land()
         else:
-            self.vehicle.mode = VehicleMode("LAND")
-        self.send_response("LANDING...")
+            # VTOL: Use QLAND for vertical landing
+            land_mode = "QLAND" if IS_VTOL else "LAND"
+            self.vehicle.mode = VehicleMode(land_mode)
+        self.send_response(f"{'QLAND' if IS_VTOL else 'LAND'}: Vertical landing...")
     
     def cmd_rtl(self):
-        """Return to launch."""
+        """Return to launch using VTOL vertical RTL (QRTL)."""
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.return_to_launch()
         else:
-            self.vehicle.mode = VehicleMode("RTL")
-        self.send_response("RTL: Returning to launch")
+            # VTOL: Use QRTL for vertical return to launch
+            rtl_mode = "QRTL" if IS_VTOL else "RTL"
+            self.vehicle.mode = VehicleMode(rtl_mode)
+        self.send_response(f"{'QRTL' if IS_VTOL else 'RTL'}: Returning to launch")
     
     def cmd_abort(self):
-        """Emergency abort."""
+        """Emergency abort - immediate VTOL vertical landing."""
         self.log("warning", "EMERGENCY ABORT!")
         
         # Stop any running mission
@@ -770,9 +843,11 @@ class MainController:
         if NIDAR_AVAILABLE and self.safety_abort:
             self.safety_abort.emergency_land()
         else:
-            self.vehicle.mode = VehicleMode("LAND")
+            # VTOL: Use QLAND for vertical emergency landing
+            land_mode = "QLAND" if IS_VTOL else "LAND"
+            self.vehicle.mode = VehicleMode(land_mode)
         
-        self.send_response("ABORT: Emergency landing!")
+        self.send_response(f"ABORT: Emergency {'QLAND' if IS_VTOL else 'LAND'}!")
     
     def cmd_set_mode(self, mode):
         """Change flight mode."""
@@ -1934,8 +2009,8 @@ def main():
                        help='Pixhawk port (default: /dev/ttyACM0)')
     parser.add_argument('--pixhawk-baud', type=int, default=115200,
                        help='Pixhawk baud rate (default: 115200)')
-    parser.add_argument('--radio', default='/dev/ttyUSB-radio',
-                       help='LoRa/3DR radio port (default: /dev/ttyUSB-radio)')
+    parser.add_argument('--radio', default='/dev/ttyUSB0',
+                       help='LoRa/3DR radio port (default: /dev/ttyUSB0)')
     parser.add_argument('--radio-baud', type=int, default=57600,
                        help='Radio baud rate (default: 57600)')
     parser.add_argument('--no-radio', action='store_true',

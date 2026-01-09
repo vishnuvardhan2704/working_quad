@@ -10,7 +10,7 @@
 #
 
 SERVICE_NAME="lora"
-LOG_DIR="/home/dart/quadtest/logs"
+LOG_DIR="/home/dart2/duplicate_scout_drone/working_quad/logs"
 DATE_STAMP=$(date +"%Y-%m-%d")
 TIME_STAMP=$(date +"%H-%M-%S")
 

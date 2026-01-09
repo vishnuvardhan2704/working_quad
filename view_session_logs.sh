@@ -13,7 +13,7 @@
 #   ./view_session_logs.sh commands     - Show only RX/TX commands from latest session
 #
 
-LOG_DIR="/home/dart/quadtest/logs/sessions"
+LOG_DIR="/home/dart2/duplicate_scout_drone/working_quad/logs/sessions"
 
 # Colors
 RED='\033[0;31m'

@@ -2,7 +2,7 @@
 File-based session logger for LoRa service.
 Automatically saves logs from each session to timestamped files.
 
-Logs are saved to: /home/dart/quadtest/logs/sessions/
+Logs are saved to: /home/dart2/duplicate_scout_drone/working_quad/logs/sessions/
 Each session creates a new log file with timestamp.
 
 Log Format:
@@ -35,7 +35,7 @@ class SessionFileLogger:
     """
     
     # Base log directory
-    LOG_BASE_DIR = "/home/dart/quadtest/logs/sessions"
+    LOG_BASE_DIR = "/home/dart2/duplicate_scout_drone/working_quad/logs/sessions"
     
     # ANSI color codes for console output
     RESET = "\033[0m"
