@@ -2,7 +2,7 @@
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2" xmlns:kml="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom">
 <Document>
 	<name>Untitled map</name>
-	<gx:CascadingStyle kml:id="__managed_style_2CB6B56DFA3CC3DA3948">
+	<gx:CascadingStyle kml:id="__managed_style_2DF8C9ACA53CE22C0918">
 		<Style>
 			<IconStyle>
 				<scale>1.2</scale>
@@ -15,7 +15,7 @@
 			</LabelStyle>
 			<LineStyle>
 				<color>ff2dc0fb</color>
-				<width>6</width>
+				<width>4.8</width>
 			</LineStyle>
 			<PolyStyle>
 				<color>40ffffff</color>
@@ -25,7 +25,7 @@
 			</BalloonStyle>
 		</Style>
 	</gx:CascadingStyle>
-	<gx:CascadingStyle kml:id="__managed_style_10B153DB263CC3DA3948">
+	<gx:CascadingStyle kml:id="__managed_style_193570E3DB3CE22C0918">
 		<Style>
 			<IconStyle>
 				<Icon>
@@ -37,7 +37,7 @@
 			</LabelStyle>
 			<LineStyle>
 				<color>ff2dc0fb</color>
-				<width>4</width>
+				<width>3.2</width>
 			</LineStyle>
 			<PolyStyle>
 				<color>40ffffff</color>
@@ -47,34 +47,34 @@
 			</BalloonStyle>
 		</Style>
 	</gx:CascadingStyle>
-	<StyleMap id="__managed_style_0AADF59E1C3CC3DA3948">
+	<StyleMap id="__managed_style_0803E2DDE73CE22C0918">
 		<Pair>
 			<key>normal</key>
-			<styleUrl>#__managed_style_10B153DB263CC3DA3948</styleUrl>
+			<styleUrl>#__managed_style_193570E3DB3CE22C0918</styleUrl>
 		</Pair>
 		<Pair>
 			<key>highlight</key>
-			<styleUrl>#__managed_style_2CB6B56DFA3CC3DA3948</styleUrl>
+			<styleUrl>#__managed_style_2DF8C9ACA53CE22C0918</styleUrl>
 		</Pair>
 	</StyleMap>
-	<Placemark id="0E3E4C0AA23CC3DA3920">
+	<Placemark id="0ABDF2047B3CE22C0900">
 		<name>Untitled polygon</name>
 		<LookAt>
-			<longitude>78.31847980929399</longitude>
-			<latitude>17.3903717186042</latitude>
-			<altitude>571.5898798965309</altitude>
+			<longitude>77.55342628082269</longitude>
+			<latitude>28.45874975770397</latitude>
+			<altitude>225.1895970433477</altitude>
 			<heading>0</heading>
 			<tilt>0</tilt>
 			<gx:fovy>35</gx:fovy>
-			<range>315.6562355878851</range>
+			<range>286.4586719912041</range>
 			<altitudeMode>absolute</altitudeMode>
 		</LookAt>
-		<styleUrl>#__managed_style_0AADF59E1C3CC3DA3948</styleUrl>
+		<styleUrl>#__managed_style_0803E2DDE73CE22C0918</styleUrl>
 		<Polygon>
 			<outerBoundaryIs>
 				<LinearRing>
 					<coordinates>
-						78.31798824063013,17.39033912214548,0 78.31810552961643,17.39014626736583,0 78.31836866224567,17.39005953222616,0 78.31853035140259,17.39013069882568,0 78.31857304953922,17.3903543091263,0 78.31843319715402,17.39056514929566,0 78.31812017584906,17.39062839759461,0 78.31798824063013,17.39033912214548,0 
+						77.55328509227147,28.45851169828559,0 77.55333309849304,28.45884192008371,0 77.55295750318155,28.45917742963195,0 77.55283842797709,28.45884344060027,0 77.55328509227147,28.45851169828559,0 
 					</coordinates>
 				</LinearRing>
 			</outerBoundaryIs>

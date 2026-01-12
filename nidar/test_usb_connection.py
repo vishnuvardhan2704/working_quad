@@ -5,7 +5,7 @@ USB Connection Test Script for Pixhawk
 Tests Pixhawk communication via USB cable (no TX/RX wiring needed).
 
 Usage:
-    python test_usb_connection.py
+    python                                                                                         _connection.py
 
 Connect Pixhawk to Raspberry Pi via USB cable, then run this script.
 """
