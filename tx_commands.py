@@ -8,11 +8,13 @@ This script runs on the REMOTE laptop (ground station).
 Commands:
     ARM           - Arm the drone
     DISARM        - Disarm the drone
-    TAKEOFF:5     - Takeoff to 5 meters
+    TAKEOFF:5     - Takeoff to 5 meters (gradual throttle)
     LAND          - Land the drone
     RTL           - Return to launch
     SCOUT         - Start KML area survey mission (human detection)
     KML:SURVEY:file,alt - Custom KML survey (e.g. KML:SURVEY:area.kml,20)
+    S15           - Set scout altitude to 15m (quick command: S + altitude)
+    ALT:15        - Alternative: Set scout altitude to 15m
     MODE:STABILIZE - Change to stabilize mode
     MODE:LOITER   - Change to loiter mode
     MODE:GUIDED   - Change to guided mode
@@ -21,6 +23,14 @@ Commands:
     STATUS        - Get drone status
     ABORT         - Emergency abort
     PING          - Test connection
+    
+    Shorthand Commands (quick access):
+    1             - ARM
+    2             - DISARM  
+    3:10          - TAKEOFF to 10m (altitude required)
+    4             - LAND
+    X             - ABORT (emergency)
+    S15           - Set scout altitude to 15m (altitude required)
     
 Usage:
     python3 tx_commands.py

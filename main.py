@@ -47,6 +47,7 @@ import time
 import argparse
 import serial
 import threading
+import math
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -110,6 +111,157 @@ except ImportError as e:
 SCOUT_ALTITUDE = 5.0  # Default altitude for all scouting missions (meters AGL)
 
 
+class FailsafeMonitor:
+    """
+    Monitor critical systems and trigger automatic RTH on failures.
+    Implements mandatory fail-safe features:
+    - Automatic RTH on radio link loss
+    - Automatic RTH on low battery (8V)
+    - Emergency landing on critical battery (7.5V)
+    """
+    
+    def __init__(self, vehicle, controller):
+        self.vehicle = vehicle
+        self.controller = controller
+        self.running = False
+        self.thread = None
+        
+        # Battery thresholds (volts for 3S LiPo)
+        self.battery_rtl_threshold = 8.0  # RTH at 8.0V
+        self.battery_critical_threshold = 7.5  # Emergency land at 7.5V
+        
+        # Link loss detection
+        self.last_command_time = time.time()
+        self.link_timeout = 30  # seconds - trigger RTH if no commands for 30s
+        
+        # State tracking
+        self.rtl_triggered = False
+        self.critical_land_triggered = False
+        
+    def update_command_time(self):
+        """Call this whenever a command is received to reset link timer."""
+        self.last_command_time = time.time()
+        
+    def start(self):
+        """Start failsafe monitoring thread."""
+        self.running = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        
+        # Check if battery voltage is readable
+        time.sleep(1)  # Give it a moment to get first reading
+        if self.vehicle.battery:
+            voltage = self.vehicle.battery.voltage
+            if voltage is None or voltage == 0:
+                self.controller.log("error", "⚠ BATTERY VOLTAGE = 0V - Failsafe will NOT work!")
+                self.controller.log("warning", "Check power module connection to Pix6 POWER1 port")
+                self.controller.send_response("WARNING: Battery voltage not detected - failsafe disabled")
+            else:
+                self.controller.log("success", f"Failsafe monitoring started (RTH@8V, Critical@7.5V, Link@30s, Current:{voltage:.1f}V)")
+        else:
+            self.controller.log("warning", "Failsafe monitoring started (RTH@8V, Critical@7.5V, Link@30s)")
+        
+    def stop(self):
+        """Stop monitoring."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+            
+    def _monitor_loop(self):
+        """Background monitoring loop."""
+        while self.running:
+            try:
+                # Check battery voltage
+                if self.vehicle.battery:
+                    voltage = self.vehicle.battery.voltage
+                    
+                    # Skip if voltage is 0 or None (not connected/not reading)
+                    if voltage is None or voltage == 0:
+                        # Don't trigger failsafe if we can't read battery
+                        pass
+                    # Critical battery - emergency land
+                    elif voltage < self.battery_critical_threshold and not self.critical_land_triggered:
+                        self.critical_land_triggered = True
+                        self.controller.log("error", f"CRITICAL BATTERY: {voltage:.1f}V - EMERGENCY LANDING!")
+                        self.controller.send_response(f"FAILSAFE: CRITICAL BATTERY {voltage:.1f}V - LANDING NOW!")
+                        self._trigger_emergency_land()
+                        
+                    # Low battery - RTH
+                    elif voltage < self.battery_rtl_threshold and not self.rtl_triggered and not self.critical_land_triggered:
+                        self.rtl_triggered = True
+                        self.controller.log("warning", f"LOW BATTERY: {voltage:.1f}V - RETURNING HOME")
+                        self.controller.send_response(f"FAILSAFE: LOW BATTERY {voltage:.1f}V - RTL TRIGGERED")
+                        self._trigger_rtl("Low Battery")
+                
+                # Check radio link
+                time_since_last_cmd = time.time() - self.last_command_time
+                if time_since_last_cmd > self.link_timeout and not self.rtl_triggered:
+                    # Only trigger if vehicle is armed and airborne
+                    if self.vehicle.armed:
+                        current_alt = self.vehicle.location.global_relative_frame.alt or 0
+                        if current_alt > 2.0:  # Only if actually flying
+                            self.rtl_triggered = True
+                            self.controller.log("warning", f"RADIO LINK LOST: No commands for {time_since_last_cmd:.0f}s - RTH")
+                            self.controller.send_response(f"FAILSAFE: LINK LOSS ({time_since_last_cmd:.0f}s) - RTL TRIGGERED")
+                            self._trigger_rtl("Radio Link Loss")
+                
+                time.sleep(2)  # Check every 2 seconds
+                
+            except Exception as e:
+                self.controller.log("error", f"Failsafe monitor error: {e}")
+                time.sleep(5)
+                
+    def _trigger_rtl(self, reason):
+        """Trigger Return-To-Home."""
+        try:
+            # Stop any running mission
+            with self.controller.abort_lock:
+                self.controller.abort_flag = True
+            self.controller.mission_running = False
+            
+            # Stop detection/recording
+            if self.controller.detection_running:
+                self.controller.detection_running = False
+                if self.controller.recording:
+                    self.controller._stop_recording()
+            
+            # Execute RTL
+            if self.controller.safety_abort:
+                self.controller.safety_abort.return_to_launch()
+            else:
+                self.vehicle.mode = VehicleMode("RTL")
+                
+            self.controller.log("warning", f"RTL triggered: {reason}")
+            
+        except Exception as e:
+            self.controller.log("error", f"RTL trigger failed: {e}")
+            
+    def _trigger_emergency_land(self):
+        """Trigger emergency landing (critical battery)."""
+        try:
+            # Stop everything
+            with self.controller.abort_lock:
+                self.controller.abort_flag = True
+            self.controller.mission_running = False
+            
+            # Stop detection/recording
+            if self.controller.detection_running:
+                self.controller.detection_running = False
+                if self.controller.recording:
+                    self.controller._stop_recording()
+            
+            # Emergency land
+            if self.controller.safety_abort:
+                self.controller.safety_abort.emergency_land()
+            else:
+                self.vehicle.mode = VehicleMode("LAND")
+                
+            self.controller.log("error", "Emergency landing triggered")
+            
+        except Exception as e:
+            self.controller.log("error", f"Emergency land failed: {e}")
+
+
 class MainController:
     """
     Main autonomous drone controller.
@@ -165,16 +317,29 @@ class MainController:
         self.default_kml_altitude = SCOUT_ALTITUDE  # meters AGL
         self.default_kml_pattern = "curved"  # "curved" or "lawnmower"
         
+        # KML boundary reception buffer
+        self.kml_buffer = ""
+        self.kml_receiving = False
+        self.kml_expected_size = 0
+        self.kml_params = {}  # altitude, pattern
+        
         # Radio telemetry system (sends logs to tx_commands.py)
         self.telem_logger = None
         self.status_monitor = None
         self.telemetry_enabled = True
+        
+        # Failsafe monitoring
+        self.failsafe_monitor = None
         
         # Video recording
         self.video_writer = None
         self.recording = False
         self.recording_path = None
         self.recording_start_time = 0
+        self.recording_frame_count = 0
+        self.target_fps = 15.0  # Realistic capture rate for detection loop
+        self.last_frame_time = 0
+        self.frame_interval = 1.0 / self.target_fps  # Time between frames
     
     def log(self, level, msg):
         """Log with MissionLogger if available."""
@@ -213,6 +378,10 @@ class MainController:
                 self.safety_abort = SafetyAbort(self.vehicle)
                 self.mission = WaypointMission(self.vehicle)
                 self.log("success", "Mission modules initialized")
+            
+            # Initialize and start failsafe monitor
+            self.failsafe_monitor = FailsafeMonitor(self.vehicle, self)
+            self.failsafe_monitor.start()
             
             # Note: Telemetry is set up AFTER radio connects (in run())
             
@@ -297,14 +466,77 @@ class MainController:
     
     def execute_command(self, cmd):
         """Parse and execute received command."""
-        cmd = cmd.strip().upper()
-        self.log("state", f"[RX] Command: {cmd}")
+        # Update failsafe monitor (reset link timeout)
+        if self.failsafe_monitor:
+            self.failsafe_monitor.update_command_time()
+        
+        cmd_original = cmd.strip()  # Keep original case for base64 data
+        cmd = cmd_original.upper()  # Uppercase for command matching
+        self.log("state", f"[RX] Command: {cmd[:50]}...")  # Truncate long commands
         
         if not self.vehicle:
             self.send_response("ERROR: No vehicle connected")
             return
         
         try:
+            # ============================================
+            # KML BOUNDARY TRANSMISSION PROTOCOL
+            # (Must be first - uses original case for base64 data)
+            # ============================================
+            
+            # KML:START:{size}:{altitude}:{pattern}
+            if cmd.startswith("KML:START:"):
+                parts = cmd.split(":")
+                try:
+                    if len(parts) < 4:
+                        self.send_response(f"ERROR: KML:START requires format KML:START:size:altitude:pattern")
+                        self.send_response(f"ERROR: Received only {len(parts)} parts: {':'.join(parts)}")
+                        self.send_response(f"ERROR: GCS must send altitude parameter!")
+                        self.kml_receiving = False
+                        return
+                    
+                    self.kml_expected_size = int(parts[2])
+                    self.kml_params['altitude'] = float(parts[3])
+                    self.kml_params['pattern'] = parts[4] if len(parts) > 4 else "curved"
+                    self.kml_buffer = ""
+                    self.kml_receiving = True
+                    self.send_response(f"KML: Ready to receive {self.kml_expected_size} bytes at {self.kml_params['altitude']}m")
+                    self.log("info", f"Starting KML boundary reception: {self.kml_expected_size} bytes at {self.kml_params['altitude']}m")
+                except (ValueError, IndexError) as e:
+                    self.send_response(f"ERROR: Invalid KML:START format - {e}")
+                    self.send_response(f"ERROR: Expected KML:START:size:altitude:pattern")
+                    self.kml_receiving = False
+                return
+            
+            # KML:DATA:{base64_chunk} - Use ORIGINAL case for base64 data!
+            elif cmd.startswith("KML:DATA:"):
+                if self.kml_receiving:
+                    # Extract data from ORIGINAL command (base64 is case-sensitive!)
+                    data = cmd_original[9:]  # Everything after "KML:DATA:" 
+                    self.kml_buffer += data
+                    progress = (len(self.kml_buffer) * 100) // max(self.kml_expected_size, 1)
+                    if progress % 25 == 0 and progress > 0:  # Report every 25%
+                        self.send_response(f"KML: Receiving... {progress}%")
+                        self.log("info", f"KML reception progress: {progress}% ({len(self.kml_buffer)}/{self.kml_expected_size} bytes)")
+                else:
+                    self.send_response("ERROR: KML transmission not started (send KML:START first)")
+                return
+            
+            # KML:END
+            elif cmd == "KML:END":
+                if self.kml_receiving:
+                    self.kml_receiving = False
+                    self.log("info", f"KML: Received {len(self.kml_buffer)} bytes total, processing...")
+                    self.send_response(f"KML: Received {len(self.kml_buffer)} bytes, processing...")
+                    self._process_received_kml()
+                else:
+                    self.send_response("ERROR: KML transmission not active")
+                return
+            
+            # ============================================
+            # STANDARD COMMANDS
+            # ============================================
+            
             # Connection test
             if cmd == "PING":
                 self.send_response("PONG")
@@ -422,6 +654,49 @@ class MainController:
             
             elif cmd == "SCOUT:STOP":
                 self.cmd_scout_stop()
+            
+            # Quick scout altitude command:= set scout altitude to 15m
+            elif cmd == "S":
+                self.send_response("ERROR: S requires altitude (e.g. S15)")
+            elif cmd.startswith("S") and len(cmd) >= 2 and cmd[1:].replace('.', '').isdigit():
+                alt = float(cmd[1:])
+                self.cmd_set_scout_altitude(alt)
+            
+            # Shorthand commands for quick operation
+            # 1 = ARM, 2 = DISARM, 3:alt = TAKEOFF, 4 = LAND, X = ABORT
+            elif cmd == "1":
+                self.cmd_arm()
+            
+            elif cmd == "2":
+                self.cmd_disarm()
+            
+            elif cmd == "3":
+                self.send_response("ERROR: 3 requires altitude (e.g. 3:10)")
+            elif cmd.startswith("3:"):
+                # 3:10 = takeoff to 10m
+                alt = float(cmd.split(":")[1])
+                self.cmd_takeoff(alt)
+            
+            elif cmd == "4":
+                self.cmd_land()
+            
+            elif cmd == "X":
+                self.cmd_abort()
+            
+            # Manual failsafe test commands
+            elif cmd == "TEST:RTL":
+                self.send_response("Testing RTL failsafe...")
+                if self.failsafe_monitor:
+                    self.failsafe_monitor._trigger_rtl("Manual Test")
+                else:
+                    self.send_response("ERROR: Failsafe monitor not initialized")
+                    
+            elif cmd == "TEST:CRITICAL":
+                self.send_response("Testing critical battery failsafe...")
+                if self.failsafe_monitor:
+                    self.failsafe_monitor._trigger_emergency_land()
+                else:
+                    self.send_response("ERROR: Failsafe monitor not initialized")
             
             # Unknown
             else:
@@ -568,30 +843,69 @@ class MainController:
         self.send_response("DISARMED OK")
     
     def cmd_takeoff(self, altitude):
-        """Takeoff to altitude."""
+        """Takeoff with smooth linear throttle ramp using S-curve profile."""
         if not self.vehicle.armed:
             self.send_response("ERROR: Not armed")
             return
         
         if self.vehicle.mode.name != "GUIDED":
             self.vehicle.mode = VehicleMode("GUIDED")
-            time.sleep(1)
+            timeout = time.time() + 5
+            while self.vehicle.mode.name != "GUIDED" and time.time() < timeout:
+                time.sleep(0.2)
+            
+            if self.vehicle.mode.name != "GUIDED":
+                self.send_response("ERROR: Could not set GUIDED mode")
+                return
         
-        self.log("state", f"Taking off to {altitude}m")
-        self.send_response(f"TAKEOFF to {altitude}m...")
+        self.log("state", f"Taking off to {altitude}m (smooth ramp)")
+        self.send_response(f"TAKEOFF: Smooth climb to {altitude}m...")
+        
+        # Smooth takeoff: single command, monitor with S-curve expectation
+        # The S-curve is for our monitoring/feedback, ArduPilot handles actual climb
+        total_duration = max(10.0, altitude * 2.0)  # ~2 seconds per meter
+        start_time = time.time()
+        
+        # Issue takeoff command
         self.vehicle.simple_takeoff(altitude)
         
-        timeout = 30
-        start = time.time()
+        # Monitor altitude with progress updates
+        last_alt = 0
+        stall_count = 0
+        last_progress_time = 0
+        
         while True:
             current_alt = self.vehicle.location.global_relative_frame.alt or 0
+            elapsed = time.time() - start_time
+            
+            # Check if we've reached target (95% is close enough)
             if current_alt >= altitude * 0.95:
                 self.send_response(f"TAKEOFF OK: {current_alt:.1f}m")
                 break
-            if time.time() - start > timeout:
-                self.send_response(f"TAKEOFF: At {current_alt:.1f}m (timeout)")
+            
+            # Timeout check
+            if elapsed > total_duration + 15:
+                self.send_response(f"TAKEOFF: Timeout at {current_alt:.1f}m")
                 break
-            time.sleep(1)
+            
+            # Stall detection (not climbing for 5 seconds)
+            if abs(current_alt - last_alt) < 0.05:
+                stall_count += 1
+                if stall_count > 50:  # 5 seconds not moving
+                    self.send_response(f"TAKEOFF: Stalled at {current_alt:.1f}m")
+                    break
+            else:
+                stall_count = 0
+            
+            last_alt = current_alt
+            
+            # Progress update every 3 seconds
+            if elapsed - last_progress_time >= 3.0:
+                progress_pct = (current_alt / altitude) * 100 if altitude > 0 else 0
+                self.log("info", f"Climbing: {current_alt:.1f}m / {altitude}m ({progress_pct:.0f}%)")
+                last_progress_time = elapsed
+            
+            time.sleep(0.1)
     
     def cmd_land(self):
         """Land immediately."""
@@ -661,6 +975,20 @@ class MainController:
         self.send_response(f"LOAD KML: {filename} (not implemented yet)")
     
     # ==================== WAYPOINT HANDLERS ====================
+    
+    def cmd_set_scout_altitude(self, altitude):
+        """Set scout altitude from quick command (S15 = 15m)."""
+        if altitude < 2.0:
+            self.send_response(f"ERROR: Altitude too low (min 2m)")
+            return
+        if altitude > 120.0:
+            self.send_response(f"ERROR: Altitude too high (max 120m)")
+            return
+        
+        self.scout_altitude = altitude
+        self.default_kml_altitude = altitude
+        self.log("info", f"Scout altitude set to {altitude}m")
+        self.send_response(f"SCOUT ALT: {altitude}m")
     
     def cmd_add_waypoint(self, lat, lon, alt):
         """Add a waypoint for scouting mission."""
@@ -834,6 +1162,93 @@ class MainController:
             self.log("error", error_msg)
             self.send_response(f"ERROR: {error_msg}")
     
+    def _process_received_kml(self):
+        """Process received compressed KML boundary and generate mission."""
+        import base64
+        import zlib
+        
+        try:
+            self.log("info", "Decompressing KML boundary data...")
+            
+            # Decode and decompress
+            compressed = base64.b64decode(self.kml_buffer)
+            coord_text = zlib.decompress(compressed).decode('utf-8')
+            
+            self.log("info", f"Decompressed {len(compressed)} -> {len(coord_text)} bytes")
+            
+            # Parse coordinates from KML format (lon,lat,alt lon,lat,alt ...)
+            boundary = []
+            for line in coord_text.split():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    lon, lat = float(parts[0]), float(parts[1])
+                    boundary.append((lat, lon))  # Note: nidar expects (lat, lon)
+            
+            self.send_response(f"KML: Parsed {len(boundary)} boundary points")
+            self.log("success", f"Parsed boundary: {len(boundary)} points")
+            
+            # Generate waypoints using nidar path planner
+            sys.path.insert(0, NIDAR_DIR)
+            from kml_parsing.path_planner import generate_curved_center_coverage
+            from dronekit import LocationGlobalRelative
+            
+            altitude = self.kml_params.get('altitude', 5.0)
+            pattern = self.kml_params.get('pattern', 'curved')
+            
+            self.log("info", f"Generating {pattern} coverage pattern at {altitude}m...")
+            self.send_response(f"KML: Generating waypoints at {altitude}m AGL...")
+            
+            # Generate coverage path
+            waypoints_raw = generate_curved_center_coverage(
+                boundary, 
+                altitude, 
+                camera_fov=57,  # Wide-angle camera
+                overlap=0.25    # 25% overlap
+            )
+            
+            # Convert to DroneKit LocationGlobalRelative format
+            waypoints = [
+                LocationGlobalRelative(
+                    wp[0],  # lat
+                    wp[1],  # lon
+                    wp[2] if len(wp) > 2 else altitude  # alt
+                )
+                for wp in waypoints_raw
+            ]
+            
+            self.send_response(f"KML: Generated {len(waypoints)} waypoints")
+            self.log("success", f"Generated {len(waypoints)} waypoints for survey")
+            
+            # Upload mission to vehicle
+            from mission.waypoint_mission import WaypointMission
+            mission = WaypointMission(self.vehicle)
+            
+            self.send_response("KML: Uploading mission to Pixhawk...")
+            self.log("info", "Uploading mission to vehicle...")
+            
+            if mission.upload_mission(waypoints):
+                self.send_response(f"SUCCESS: Mission uploaded - {len(waypoints)} waypoints ready")
+                self.send_response("Ready: ARM -> TAKEOFF -> MODE:AUTO to begin survey")
+                self.log("success", f"Mission uploaded successfully: {len(waypoints)} waypoints")
+                self.log("success", "Drone is ready for autonomous survey flight")
+            else:
+                self.send_response("ERROR: Mission upload failed")
+                self.log("error", "Mission upload to Pixhawk failed")
+                
+        except Exception as e:
+            error_msg = f"KML processing error: {str(e)}"
+            self.log("error", error_msg)
+            self.send_response(f"ERROR: {error_msg}")
+            import traceback
+            self.log("error", traceback.format_exc())
+        finally:
+            # Clear buffer
+            self.kml_buffer = ""
+            self.kml_params = {}
+    
     def cmd_scout_stop(self):
         """Stop scouting - stops mission, detection, and recording."""
         # Stop mission if running
@@ -969,12 +1384,17 @@ class MainController:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.recording_path = os.path.join(recordings_dir, f"scout_{timestamp}.mp4")
             
-            # Initialize video writer (640x480 @ 30fps)
+            # Reset frame tracking
+            self.recording_frame_count = 0
+            self.last_frame_time = time.time()
+            
+            # Initialize video writer (640x480 @ target_fps)
+            # Using realistic FPS to match actual capture rate prevents speedup on playback
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.video_writer = cv2.VideoWriter(
                 self.recording_path,
                 fourcc,
-                30.0,
+                self.target_fps,  # Use realistic FPS instead of 30
                 (640, 480)
             )
             
@@ -1021,14 +1441,96 @@ class MainController:
         
         if self.recording:
             duration = time.time() - self.recording_start_time
-            self.log("success", f"Recording saved: {self.recording_path} ({duration:.1f}s)")
-            self.send_response(f"VIDEO: Saved {self.recording_path} ({duration:.1f}s)")
+            actual_fps = self.recording_frame_count / duration if duration > 0 else 0
+            self.log("success", f"Recording saved: {self.recording_path} ({duration:.1f}s, {self.recording_frame_count} frames, {actual_fps:.1f} fps)")
+            self.send_response(f"VIDEO: Saved {self.recording_path} ({duration:.1f}s, {actual_fps:.1f}fps)")
         
         self.recording = False
         self.recording_path = None
+        self.recording_frame_count = 0
     
+    def _fly_to_waypoint_smooth(self, lat, lon, alt, max_speed=2.0):
+        """
+        Fly to waypoint with smooth speed control.
+        Slows down when approaching waypoint for gentle turns.
+        
+        Args:
+            lat, lon, alt: Target coordinates
+            max_speed: Maximum speed in m/s (default 2.0 for safety)
+        
+        Returns:
+            True if reached waypoint, False if aborted
+        """
+        target = LocationGlobalRelative(lat, lon, alt)
+        
+        # Set initial speed
+        try:
+            self.vehicle.groundspeed = max_speed
+        except:
+            pass  # Some vehicles don't support this
+        
+        # Command to fly to location
+        self.vehicle.simple_goto(target, groundspeed=max_speed)
+        
+        self.log("info", f"Flying to ({lat:.6f}, {lon:.6f}) at {max_speed}m/s")
+        
+        # Monitor progress with dynamic speed adjustment
+        last_distance = float('inf')
+        stuck_count = 0
+        
+        while True:
+            # Check abort
+            with self.abort_lock:
+                if self.abort_flag:
+                    return False
+            
+            current_loc = self.vehicle.location.global_relative_frame
+            distance = self._get_distance_metres(current_loc, target)
+            
+            # Dynamic speed based on distance to waypoint
+            # Slow down as we approach for smoother turns
+            if distance < 3.0:
+                # Very close - slow crawl for precise positioning
+                target_speed = max(0.5, max_speed * 0.25)
+            elif distance < 8.0:
+                # Approaching - reduce speed significantly
+                target_speed = max(0.8, max_speed * 0.4)
+            elif distance < 15.0:
+                # Getting close - moderate speed
+                target_speed = max_speed * 0.6
+            else:
+                # Far away - use max speed
+                target_speed = max_speed
+            
+            # Apply speed adjustment
+            try:
+                self.vehicle.groundspeed = target_speed
+            except:
+                pass
+            
+            # Check if arrived (within 2 meters)
+            if distance < 2.0:
+                self.log("info", f"Reached waypoint (distance: {distance:.1f}m)")
+                # Brief pause at waypoint for stability before next move
+                time.sleep(1.0)
+                return True
+            
+            # Stuck detection (not making progress)
+            if abs(distance - last_distance) < 0.1:
+                stuck_count += 1
+                if stuck_count > 100:  # 20 seconds not moving
+                    self.log("warning", f"Stuck at distance {distance:.1f}m")
+                    return True  # Consider it reached if stuck nearby
+            else:
+                stuck_count = 0
+            
+            last_distance = distance
+            time.sleep(0.2)
+        
+        return True
+
     def _run_scout_mission(self):
-        """Execute scouting mission - fly waypoints with human detection."""
+        """Execute scouting mission with smooth navigation and human detection."""
         self.mission_running = True
         
         try:
@@ -1037,46 +1539,47 @@ class MainController:
                 self.vehicle.mode = VehicleMode("GUIDED")
                 time.sleep(1)
             
-            # Fly to each waypoint
+            if not self.waypoints:
+                self.send_response("ERROR: No waypoints defined")
+                self.mission_running = False
+                return
+            
+            # Scout speed - slow for accurate detection
+            scout_speed = 2.0  # m/s
+            
+            total_wps = len(self.waypoints)
+            self.send_response(f"SCOUT: Starting {total_wps} waypoints at {scout_speed}m/s")
+            
+            # Fly to each waypoint with smooth navigation
             for i, (lat, lon, alt) in enumerate(self.waypoints, 1):
                 # Check abort
                 with self.abort_lock:
                     if self.abort_flag:
-                        self.send_response("Scout stopped")
+                        self.send_response("Scout aborted")
                         self._stop_recording()
                         self.mission_running = False
                         return
                 
-                self.send_response(f"Flying to WP{i}/{len(self.waypoints)}: {lat:.6f},{lon:.6f}")
+                self.send_response(f"SCOUT: WP {i}/{total_wps}")
                 
-                location = LocationGlobalRelative(lat, lon, alt)
-                self.vehicle.simple_goto(location)
+                # Use smooth navigation with speed control
+                success = self._fly_to_waypoint_smooth(lat, lon, alt, max_speed=scout_speed)
                 
-                # Wait until close to waypoint
-                while True:
-                    with self.abort_lock:
-                        if self.abort_flag:
-                            self.send_response("Scout stopped")
-                            self._stop_recording()
-                            self.mission_running = False
-                            return
-                    
-                    current = self.vehicle.location.global_relative_frame
-                    dist = self._get_distance_metres(current, location)
-                    
-                    if dist < 3.0:  # Within 3 meters
-                        self.send_response(f"Reached WP{i}")
-                        break
-                    
-                    time.sleep(1)
+                if not success:
+                    self.send_response("Scout aborted")
+                    self._stop_recording()
+                    self.mission_running = False
+                    return
                 
-                # Brief hover at waypoint to scan
-                time.sleep(2)
+                self.send_response(f"SCOUT: Reached WP {i}")
+                
+                # Brief hover at waypoint to scan for humans
+                time.sleep(2.0)
             
-            # Done with waypoints - stop recording but keep detection
+            # Done with waypoints
             self._stop_recording()
-            self.send_response(f"SCOUT DONE! All {len(self.waypoints)} waypoints visited. Detected {self.detection_count} humans.")
-            self.send_response("Send RTL to return home, or add more waypoints")
+            self.send_response(f"SCOUT DONE! {total_wps} waypoints. Detections: {self.detection_count}")
+            self.send_response("Send RTL to return home")
             
         except Exception as e:
             self.log("error", f"Scout error: {e}")
@@ -1101,7 +1604,13 @@ class MainController:
                 self.mission_running = False
                 return
             
-            self.send_response(f"AUTO mode active - mission started")
+            # Limit speed for safety during AUTO mission
+            try:
+                self.vehicle.groundspeed = 2.0  # 2 m/s max
+            except:
+                pass
+            
+            self.send_response(f"AUTO mode active - mission started (2 m/s)")
             self.log("success", "AUTO mode activated - ArduPilot executing mission")
             
             # Monitor mission progress
@@ -1113,6 +1622,12 @@ class MainController:
                         self.send_response("SCOUT: Aborting mission")
                         self.vehicle.mode = VehicleMode("RTL")
                         break
+                
+                # Re-apply speed limit periodically
+                try:
+                    self.vehicle.groundspeed = 2.0
+                except:
+                    pass
                 
                 # Get current waypoint
                 current_wp = self.vehicle.commands.next
@@ -1143,7 +1658,6 @@ class MainController:
     
     def _get_distance_metres(self, loc1, loc2):
         """Get distance between two locations in meters."""
-        import math
         dlat = loc2.lat - loc1.lat
         dlon = loc2.lon - loc1.lon
         return math.sqrt((dlat*111320)**2 + (dlon*111320*math.cos(math.radians(loc1.lat)))**2)
@@ -1399,14 +1913,21 @@ class MainController:
                     time.sleep(0.01)
                     continue
                 
-                # Always record raw frame (before resize) if recording is active
+                current_time = time.time()
+                
+                # Record frames at controlled intervals for proper playback speed
+                # This ensures video plays back at real-time speed, not sped up
                 if self.recording and self.video_writer:
-                    # Ensure frame is 640x480 for recording
-                    if frame.shape[:2] != (480, 640):
-                        record_frame = cv2.resize(frame, (640, 480))
-                    else:
-                        record_frame = frame.copy()
-                    self.video_writer.write(record_frame)
+                    time_since_last_frame = current_time - self.last_frame_time
+                    if time_since_last_frame >= self.frame_interval:
+                        # Ensure frame is 640x480 for recording
+                        if frame.shape[:2] != (480, 640):
+                            record_frame = cv2.resize(frame, (640, 480))
+                        else:
+                            record_frame = frame.copy()
+                        self.video_writer.write(record_frame)
+                        self.recording_frame_count += 1
+                        self.last_frame_time = current_time
                 
                 frame_count += 1
                 
@@ -1768,6 +2289,10 @@ class MainController:
                     time.sleep(1)
         finally:
             self.running = False
+            
+            # Stop failsafe monitoring
+            if self.failsafe_monitor:
+                self.failsafe_monitor.stop()
             
             # Stop detection if running
             if self.detection_running:

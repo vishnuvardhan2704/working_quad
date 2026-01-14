@@ -2,7 +2,7 @@
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2" xmlns:kml="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom">
 <Document>
 	<name>Untitled map</name>
-	<gx:CascadingStyle kml:id="__managed_style_2DF8C9ACA53CE22C0918">
+	<gx:CascadingStyle kml:id="__managed_style_2301034D0F3CEB23B80C">
 		<Style>
 			<IconStyle>
 				<scale>1.2</scale>
@@ -25,7 +25,7 @@
 			</BalloonStyle>
 		</Style>
 	</gx:CascadingStyle>
-	<gx:CascadingStyle kml:id="__managed_style_193570E3DB3CE22C0918">
+	<gx:CascadingStyle kml:id="__managed_style_1EA968EE993CEB23B80C">
 		<Style>
 			<IconStyle>
 				<Icon>
@@ -47,34 +47,34 @@
 			</BalloonStyle>
 		</Style>
 	</gx:CascadingStyle>
-	<StyleMap id="__managed_style_0803E2DDE73CE22C0918">
+	<StyleMap id="__managed_style_0FC67333E83CEB23B80C">
 		<Pair>
 			<key>normal</key>
-			<styleUrl>#__managed_style_193570E3DB3CE22C0918</styleUrl>
+			<styleUrl>#__managed_style_1EA968EE993CEB23B80C</styleUrl>
 		</Pair>
 		<Pair>
 			<key>highlight</key>
-			<styleUrl>#__managed_style_2DF8C9ACA53CE22C0918</styleUrl>
+			<styleUrl>#__managed_style_2301034D0F3CEB23B80C</styleUrl>
 		</Pair>
 	</StyleMap>
-	<Placemark id="0ABDF2047B3CE22C0900">
+	<Placemark id="0B6B34E1573CEB23B7F0">
 		<name>Untitled polygon</name>
 		<LookAt>
-			<longitude>77.55342628082269</longitude>
-			<latitude>28.45874975770397</latitude>
-			<altitude>225.1895970433477</altitude>
+			<longitude>77.55331562216477</longitude>
+			<latitude>28.45892212418481</latitude>
+			<altitude>225.1746192440615</altitude>
 			<heading>0</heading>
 			<tilt>0</tilt>
 			<gx:fovy>35</gx:fovy>
-			<range>286.4586719912041</range>
+			<range>170.9912211439405</range>
 			<altitudeMode>absolute</altitudeMode>
 		</LookAt>
-		<styleUrl>#__managed_style_0803E2DDE73CE22C0918</styleUrl>
+		<styleUrl>#__managed_style_0FC67333E83CEB23B80C</styleUrl>
 		<Polygon>
 			<outerBoundaryIs>
 				<LinearRing>
 					<coordinates>
-						77.55328509227147,28.45851169828559,0 77.55333309849304,28.45884192008371,0 77.55295750318155,28.45917742963195,0 77.55283842797709,28.45884344060027,0 77.55328509227147,28.45851169828559,0 
+						77.55321464206287,28.45852267058305,0 77.55346372409683,28.45865955963512,0 77.55331529815935,28.45886496527731,0 77.55295206014819,28.45869365716615,0 77.55321464206287,28.45852267058305,0 
 					</coordinates>
 				</LinearRing>
 			</outerBoundaryIs>

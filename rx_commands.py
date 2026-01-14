@@ -10,6 +10,12 @@ Listens for commands from another laptop via 3DR radio and executes them on the 
 INTEGRATED with nidar/ modules for safety checks and proper logging.
 
 Commands Supported:
+    === AUTONOMOUS MISSION ===
+    KML:START:size:alt:pattern - Start KML boundary reception (sent by GCS)
+    KML:DATA:chunk             - Receive KML data chunk (sent by GCS)
+    KML:END                    - Process received KML and upload mission
+    
+    === FLIGHT CONTROL ===
     ARM           - Arm the drone (with preflight checks)
     DISARM        - Disarm the drone
     TAKEOFF:5     - Takeoff to 5 meters
@@ -18,13 +24,22 @@ Commands Supported:
     MODE:STABILIZE - Change flight mode
     MODE:LOITER   - Change to loiter mode
     MODE:GUIDED   - Change to guided mode
+    MODE:AUTO     - Start uploaded mission (after KML upload)
     GOTO:lat,lon,alt - Go to GPS location
     MOVE:n,e,d    - Move relative (north, east, down in meters)
     STOP          - Stop and hover (BRAKE mode)
+    
+    === DIAGNOSTICS ===
     PREFLIGHT     - Run preflight checks only
+    STATUS        - Get drone status
+    PING          - Test connection (replies PONG)
+    
+    === EMERGENCY ===
     ABORT         - Emergency abort (immediate land)
-    SCOUT         - Start KML area survey mission (uses default config)
-    KML:SURVEY:filename,altitude - Custom KML survey with specific file
+    
+    === LEGACY (deprecated) ===
+    SCOUT         - [DEPRECATED] Use KML transmission protocol instead
+    KML:SURVEY:filename,altitude - [DEPRECATED] Use KML transmission protocol
     
 Hardware Setup:
     - Pixhawk connected via USB (/dev/ttyACM0)
@@ -98,6 +113,12 @@ class DroneCommandReceiver:
         # Telemetry streaming thread
         self.telemetry_thread = None
         self.telemetry_interval = 2.0  # Send telemetry every 2 seconds
+        
+        # KML boundary reception buffer
+        self.kml_buffer = ""
+        self.kml_receiving = False
+        self.kml_expected_size = 0
+        self.kml_params = {}  # altitude, pattern
         
         # Telemetry logging
         self.telemetry_log_file = None
@@ -284,15 +305,66 @@ class DroneCommandReceiver:
     
     def execute_command(self, cmd):
         """Parse and execute a command."""
-        cmd = cmd.strip().upper()
+        cmd_original = cmd.strip()  # Keep original case for base64 data
+        cmd = cmd_original.upper()  # Uppercase for command matching
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log("state", f"[RX] Command: {cmd}")
+        self.log("state", f"[RX] Command: {cmd[:50]}...")  # Truncate long commands in log
         
         if not self.vehicle:
             self.send_response("ERROR: No vehicle connected")
             return
         
         try:
+            # ============================================
+            # KML BOUNDARY TRANSMISSION PROTOCOL
+            # (Must be first - uses original case for base64 data)
+            # ============================================
+            
+            # KML:START:{size}:{altitude}:{pattern}
+            if cmd.startswith("KML:START:"):
+                parts = cmd.split(":")
+                try:
+                    self.kml_expected_size = int(parts[2])
+                    self.kml_params['altitude'] = float(parts[3])
+                    self.kml_params['pattern'] = parts[4] if len(parts) > 4 else "curved"
+                    self.kml_buffer = ""
+                    self.kml_receiving = True
+                    self.send_response(f"KML: Ready to receive {self.kml_expected_size} bytes at {self.kml_params['altitude']}m")
+                    self.log("info", f"Starting KML boundary reception: {self.kml_expected_size} bytes")
+                except (ValueError, IndexError) as e:
+                    self.send_response(f"ERROR: Invalid KML:START format - {e}")
+                    self.kml_receiving = False
+                return
+            
+            # KML:DATA:{base64_chunk} - Use ORIGINAL case for base64 data!
+            elif cmd.startswith("KML:DATA:"):
+                if self.kml_receiving:
+                    # Extract data from ORIGINAL command (base64 is case-sensitive!)
+                    data = cmd_original[9:]  # Everything after "KML:DATA:" 
+                    self.kml_buffer += data
+                    progress = (len(self.kml_buffer) * 100) // max(self.kml_expected_size, 1)
+                    if progress % 25 == 0 and progress > 0:  # Report every 25%
+                        self.send_response(f"KML: Receiving... {progress}%")
+                        self.log("info", f"KML reception progress: {progress}% ({len(self.kml_buffer)}/{self.kml_expected_size} bytes)")
+                else:
+                    self.send_response("ERROR: KML transmission not started (send KML:START first)")
+                return
+            
+            # KML:END
+            elif cmd == "KML:END":
+                if self.kml_receiving:
+                    self.kml_receiving = False
+                    self.log("info", f"KML: Received {len(self.kml_buffer)} bytes total, processing...")
+                    self.send_response(f"KML: Received {len(self.kml_buffer)} bytes, processing...")
+                    self._process_received_kml()
+                else:
+                    self.send_response("ERROR: KML transmission not active")
+                return
+            
+            # ============================================
+            # STANDARD FLIGHT COMMANDS
+            # ============================================
+            
             # ARM command (with preflight checks)
             if cmd == "ARM":
                 self.cmd_arm()
@@ -354,12 +426,14 @@ class DroneCommandReceiver:
             elif cmd == "ABORT":
                 self.cmd_abort()
             
-            # SCOUT command - use default KML configuration
+            # SCOUT command - use default KML configuration (DEPRECATED)
             elif cmd == "SCOUT":
+                self.send_response("DEPRECATED: SCOUT command deprecated, use KML transmission protocol")
                 self.cmd_kml_survey(DEFAULT_KML_FILE, DEFAULT_SCOUT_ALTITUDE)
             
-            # KML SURVEY command (KML:SURVEY:filename,altitude)
+            # KML SURVEY command (LEGACY - DEPRECATED)
             elif cmd.startswith("KML:SURVEY:"):
+                self.send_response("DEPRECATED: Use KML:START/DATA/END protocol instead")
                 params = cmd.split(":")[2].split(",")
                 kml_file = params[0]
                 altitude = float(params[1]) if len(params) > 1 else 5.0
@@ -690,6 +764,92 @@ class DroneCommandReceiver:
             error_msg = f"KML survey error: {str(e)}"
             self.log("error", error_msg)
             self.send_response(f"ERROR: {error_msg}")
+    
+    def _process_received_kml(self):
+        """Process received compressed KML boundary and generate mission."""
+        import base64
+        import zlib
+        
+        try:
+            self.log("info", "Decompressing KML boundary data...")
+            
+            # Decode and decompress
+            compressed = base64.b64decode(self.kml_buffer)
+            coord_text = zlib.decompress(compressed).decode('utf-8')
+            
+            self.log("info", f"Decompressed {len(compressed)} -> {len(coord_text)} bytes")
+            
+            # Parse coordinates from KML format (lon,lat,alt lon,lat,alt ...)
+            boundary = []
+            for line in coord_text.split():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    lon, lat = float(parts[0]), float(parts[1])
+                    boundary.append((lat, lon))  # Note: nidar expects (lat, lon)
+            
+            self.send_response(f"KML: Parsed {len(boundary)} boundary points")
+            self.log("success", f"Parsed boundary: {len(boundary)} points")
+            
+            # Generate waypoints using nidar path planner
+            from kml_parsing.path_planner import generate_curved_center_coverage
+            
+            altitude = self.kml_params.get('altitude', 5.0)
+            pattern = self.kml_params.get('pattern', 'curved')
+            
+            self.log("info", f"Generating {pattern} coverage pattern at {altitude}m...")
+            self.send_response(f"KML: Generating waypoints at {altitude}m AGL...")
+            
+            # Generate coverage path
+            waypoints_raw = generate_curved_center_coverage(
+                boundary, 
+                altitude, 
+                camera_fov=57,  # Wide-angle camera
+                overlap=0.25    # 25% overlap
+            )
+            
+            # Convert to DroneKit LocationGlobalRelative format
+            from dronekit import LocationGlobalRelative
+            waypoints = [
+                LocationGlobalRelative(
+                    wp[0],  # lat
+                    wp[1],  # lon
+                    wp[2] if len(wp) > 2 else altitude  # alt
+                )
+                for wp in waypoints_raw
+            ]
+            
+            self.send_response(f"KML: Generated {len(waypoints)} waypoints")
+            self.log("success", f"Generated {len(waypoints)} waypoints for survey")
+            
+            # Upload mission to vehicle
+            from mission.waypoint_mission import WaypointMission
+            mission = WaypointMission(self.vehicle)
+            
+            self.send_response("KML: Uploading mission to Pixhawk...")
+            self.log("info", "Uploading mission to vehicle...")
+            
+            if mission.upload_mission(waypoints):
+                self.send_response(f"SUCCESS: Mission uploaded - {len(waypoints)} waypoints ready")
+                self.send_response("Ready: ARM -> TAKEOFF -> MODE:AUTO to begin survey")
+                self.log("success", f"Mission uploaded successfully: {len(waypoints)} waypoints")
+                self.log("success", "Drone is ready for autonomous survey flight")
+            else:
+                self.send_response("ERROR: Mission upload failed")
+                self.log("error", "Mission upload to Pixhawk failed")
+                
+        except Exception as e:
+            error_msg = f"KML processing error: {str(e)}"
+            self.log("error", error_msg)
+            self.send_response(f"ERROR: {error_msg}")
+            import traceback
+            self.log("error", traceback.format_exc())
+        finally:
+            # Clear buffer
+            self.kml_buffer = ""
+            self.kml_params = {}
     
     def listen_loop(self):
         """Main loop to listen for commands."""
