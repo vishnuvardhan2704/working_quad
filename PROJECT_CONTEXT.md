@@ -260,7 +260,7 @@ missions/
 pix6_battery_diag.py          # Full battery diagnostic
 pix6_battery_setup.py         # Configure battery parameters
 pix6_deep_diag.py             # Deep MAVLink message diagnostic
-pix6_list_params.py           # List all battery parameters
+pix6_list_params.py           # List all battery parameterssudo
 voltage_test_usb.py           # Voltage reading tests
 voltage_monitor_continuous.py # Real-time voltage monitor
 ```

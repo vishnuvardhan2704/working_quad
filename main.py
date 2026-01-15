@@ -8,6 +8,7 @@ This is the main entry point that:
 3. Runs waypoint missions
 4. Supports KML file import for mission planning
 5. Performs real-time human detection using YOLOv8 ONNX model
+6. Executes precision delivery operations via visual servoing
 
 Commands received from ground station (tx_commands.py):
     PING              - Test connection
@@ -25,7 +26,7 @@ Commands received from ground station (tx_commands.py):
     MODE:xxx          - Change flight mode
     LOAD:filename     - Load KML mission file
     
-    Human Detection  Commands:
+    Human Detection Commands:
     DETECT:START      - Start human detection camera
     DETECT:STOP       - Stop human detection
     DETECT:STATUS     - Get current detection status
@@ -35,6 +36,11 @@ Commands received from ground station (tx_commands.py):
     SCOUT             - Start KML area survey mission (loads default KML file)
     SCOUT:KML:file,alt - Custom KML survey (e.g. SCOUT:KML:park.kml,20)
     SCOUT:STOP        - Stop scouting, detection, and save recording
+    
+    Precision Delivery Commands:
+    DELIVER:lat,lon   - Execute precision delivery at GPS coordinates
+    DELIVER:STOP      - Stop current delivery operation
+    DELIVER:STATUS    - Get delivery system status
 
 Usage:
     python3 main.py
@@ -106,6 +112,14 @@ try:
 except ImportError as e:
     print(f"[WARN] File logging not available: {e}")
     FILE_LOGGING_AVAILABLE = False
+
+# Import visual servo module for precision delivery
+try:
+    from visual_servo import DeliveryCommandHandler, VisualServoController
+    DELIVERY_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Visual servo delivery not available: {e}")
+    DELIVERY_AVAILABLE = False
 
 # Global constants - change these values to modify drone behavior
 SCOUT_ALTITUDE = 5.0  # Default altitude for all scouting missions (meters AGL)
@@ -331,6 +345,9 @@ class MainController:
         # Failsafe monitoring
         self.failsafe_monitor = None
         
+        # Precision delivery system (visual servo)
+        self.delivery_handler = None
+        
         # Video recording
         self.video_writer = None
         self.recording = False
@@ -382,6 +399,11 @@ class MainController:
             # Initialize and start failsafe monitor
             self.failsafe_monitor = FailsafeMonitor(self.vehicle, self)
             self.failsafe_monitor.start()
+            
+            # Initialize delivery handler for precision drop operations
+            if DELIVERY_AVAILABLE:
+                self.delivery_handler = DeliveryCommandHandler(self.vehicle, self.send_response)
+                self.log("success", "Delivery handler initialized")
             
             # Note: Telemetry is set up AFTER radio connects (in run())
             
@@ -698,6 +720,50 @@ class MainController:
                 else:
                     self.send_response("ERROR: Failsafe monitor not initialized")
             
+            # ============================================
+            # PRECISION DELIVERY COMMANDS
+            # ============================================
+            
+            # DELIVER:lat,lon - Execute delivery at GPS coordinates
+            elif cmd.startswith("DELIVER:"):
+                if not DELIVERY_AVAILABLE:
+                    self.send_response("ERROR: Delivery module not available")
+                elif not self.delivery_handler:
+                    self.send_response("ERROR: Delivery handler not initialized")
+                else:
+                    # Parse: DELIVER:lat,lon
+                    params = cmd.split(":")[1].split(",")
+                    if len(params) < 2:
+                        self.send_response("ERROR: DELIVER requires lat,lon (e.g. DELIVER:12.34,56.78)")
+                    else:
+                        lat = float(params[0])
+                        lon = float(params[1])
+                        self.send_response(f"Starting delivery at ({lat}, {lon})")
+                        # Run delivery in thread to avoid blocking
+                        threading.Thread(
+                            target=self._execute_delivery,
+                            args=(lat, lon),
+                            daemon=True
+                        ).start()
+            
+            # DELIVER:STOP - Stop current delivery operation
+            elif cmd == "DELIVER:STOP":
+                if self.delivery_handler and self.delivery_handler.servo_controller:
+                    self.delivery_handler.servo_controller.stop()
+                    self.send_response("Delivery operation stopped")
+                else:
+                    self.send_response("No delivery operation running")
+            
+            # DELIVER:STATUS - Get delivery system status
+            elif cmd == "DELIVER:STATUS":
+                if not DELIVERY_AVAILABLE:
+                    self.send_response("DELIVERY: Module not available")
+                elif not self.delivery_handler:
+                    self.send_response("DELIVERY: Handler not initialized")
+                else:
+                    running = self.delivery_handler.servo_controller.running if self.delivery_handler.servo_controller else False
+                    self.send_response(f"DELIVERY: {'ACTIVE' if running else 'IDLE'}")
+            
             # Unknown
             else:
                 self.send_response(f"ERROR: Unknown command '{cmd}'")
@@ -947,6 +1013,27 @@ class MainController:
         
         self.send_response("ABORT: Emergency landing!")
     
+    def _execute_delivery(self, lat, lon):
+        """Execute precision delivery at target location (runs in thread)."""
+        try:
+            if not self.delivery_handler:
+                self.send_response("ERROR: Delivery handler not available")
+                return
+                
+            self.log("info", f"Starting precision delivery at ({lat}, {lon})")
+            success = self.delivery_handler.execute_delivery(lat, lon)
+            
+            if success:
+                self.log("success", f"Delivery completed at ({lat}, {lon})")
+                self.send_response(f"DELIVERY: Completed at ({lat}, {lon})")
+            else:
+                self.log("warning", f"Delivery failed or aborted at ({lat}, {lon})")
+                self.send_response(f"DELIVERY: Failed/aborted at ({lat}, {lon})")
+                
+        except Exception as e:
+            self.log("error", f"Delivery error: {e}")
+            self.send_response(f"DELIVERY ERROR: {e}")
+    
     def cmd_set_mode(self, mode):
         """Change flight mode."""
         try:
@@ -960,14 +1047,135 @@ class MainController:
             self.send_response(f"MODE ERROR: {e}")
     
     def cmd_goto(self, lat, lon, alt):
-        """Go to GPS location."""
+        """
+        Go to GPS location and execute precision delivery with detection.
+        
+        Flow:
+        1. Fly to approximate GPS location at specified altitude
+        2. If delivery handler available: detect human, center, descend to 6m, hover
+        3. If no delivery handler: just fly to location (legacy behavior)
+        """
         if self.vehicle.mode.name != "GUIDED":
             self.vehicle.mode = VehicleMode("GUIDED")
             time.sleep(1)
         
-        location = LocationGlobalRelative(lat, lon, alt)
-        self.vehicle.simple_goto(location)
-        self.send_response(f"GOTO: {lat:.6f},{lon:.6f},{alt:.1f}m")
+        self.send_response(f"GOTO: Flying to {lat:.6f},{lon:.6f},{alt:.1f}m")
+        
+        # Check if delivery system is available
+        if DELIVERY_AVAILABLE and self.delivery_handler:
+            self.log("info", f"GOTO with delivery: {lat:.6f},{lon:.6f}")
+            # Run delivery in thread to avoid blocking radio listener
+            threading.Thread(
+                target=self._execute_goto_delivery,
+                args=(lat, lon, alt),
+                daemon=True
+            ).start()
+        else:
+            # Legacy behavior - just fly to location
+            location = LocationGlobalRelative(lat, lon, alt)
+            self.vehicle.simple_goto(location)
+            self.log("info", f"GOTO (no delivery): {lat:.6f},{lon:.6f},{alt:.1f}m")
+    
+    def _execute_goto_delivery(self, lat, lon, approach_alt):
+        """
+        Execute GOTO with precision delivery (runs in thread).
+        
+        1. Fly to location at approach altitude
+        2. Detect human and center using visual servo
+        3. Descend to 6m while re-centering
+        4. Hover 5 seconds for delivery
+        5. Report completion to GCS
+        """
+        try:
+            self.log("info", f"=== GOTO DELIVERY START ===")
+            self.log("info", f"Target: {lat:.6f}, {lon:.6f} at {approach_alt}m")
+            
+            # Get or create the visual servo controller
+            servo = self.delivery_handler.servo_controller
+            if not servo:
+                # Create servo controller with GCS callback
+                from visual_servo import VisualServoController
+                servo = VisualServoController(
+                    self.vehicle,
+                    logger=self.log,
+                    send_response=self.send_response
+                )
+                self.delivery_handler.servo_controller = servo
+                self.log("info", "Created new VisualServoController")
+            
+            # Ensure servo has send_response callback
+            if not servo.send_gcs:
+                servo.send_gcs = self.send_response
+            
+            # Initialize camera if not already running
+            if not servo.camera_initialized:
+                if not servo.initialize_camera():
+                    self.send_response("ERROR: Failed to initialize camera")
+                    return
+            
+            # Initialize detector if not already running
+            if not servo.detector:
+                if not servo.initialize_detector():
+                    self.send_response("ERROR: Failed to initialize detector")
+                    return
+            
+            servo.running = True
+            
+            # Step 1: Fly to approach location
+            self.send_response(f"GOTO: Approaching {lat:.6f},{lon:.6f} at {approach_alt}m")
+            if not servo.fly_to_waypoint(lat, lon, approach_alt):
+                self.send_response("GOTO: Failed to reach waypoint")
+                servo.running = False
+                return
+            
+            self.send_response("GOTO: Arrived, starting human detection...")
+            
+            # Step 2: Coarse centering at approach altitude
+            # First detect human and log to GCS
+            detection = servo.detect_human()
+            if detection:
+                center_x, center_y, conf, bbox = detection
+                curr_pos = self.vehicle.location.global_relative_frame
+                self.send_response(f"HUMAN DETECTED: 1 person(s), conf={conf:.2f}, "
+                                  f"loc={curr_pos.lat:.6f},{curr_pos.lon:.6f},{curr_pos.alt:.1f}m")
+            
+            if not servo.center_over_human(servo.COARSE_THRESHOLD):
+                self.send_response("GOTO: No human detected or centering failed")
+                servo.running = False
+                return
+            
+            self.send_response("GOTO: Human centered, descending to delivery altitude...")
+            
+            # Step 3: Descend to delivery altitude (6m) with continuous re-centering
+            if not servo.descend_with_centering(servo.DELIVERY_ALTITUDE):
+                self.send_response("GOTO: Descent failed")
+                servo.running = False
+                return
+            
+            # Step 4: Final fine centering
+            self.send_response("GOTO: Fine centering at delivery altitude...")
+            if not servo.center_over_human(servo.FINE_THRESHOLD):
+                self.send_response("GOTO: Fine centering failed")
+                servo.running = False
+                return
+            
+            # Step 5: Hover and release package
+            self.send_response("GOTO: Hovering for delivery - RELEASING PACKAGE...")
+            servo.hover(servo.HOVER_TIME, release_package=True)
+            
+            # Get final position
+            final_pos = self.vehicle.location.global_relative_frame
+            self.log("success", f"DELIVERY COMPLETE at {final_pos.lat:.6f},{final_pos.lon:.6f},{final_pos.alt:.1f}m")
+            self.send_response(f"PACKAGE DELIVERED at {final_pos.lat:.6f},{final_pos.lon:.6f},{final_pos.alt:.1f}m")
+            self.send_response(f"GOTO: DELIVERY COMPLETE at {final_pos.lat:.6f},{final_pos.lon:.6f},{final_pos.alt:.1f}m")
+            
+            servo.running = False
+            
+        except Exception as e:
+            self.log("error", f"GOTO delivery error: {e}")
+            self.send_response(f"GOTO ERROR: {e}")
+            if self.delivery_handler and self.delivery_handler.servo_controller:
+                self.delivery_handler.servo_controller.running = False
     
     def cmd_load_kml(self, filename):
         """Load mission from KML file."""
