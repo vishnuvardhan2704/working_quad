@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Main Autonomous VTOL (QuadPlane) Controller with LoRa Command Interface and Human Detection
+Main Autonomous Quadcopter Scout Drone with LoRa Command Interface and Human Detection
 
-This is the main entry point for VTOL aircraft (QuadPlane with fmuv2 firmware) that:
+This is the main entry point for quadcopter scout drone (ArduCopter with RadioLink Pix6) that:
 1. Listens for commands from ground station via LoRa/3DR radio
 2. Executes preflight checks
-3. Runs waypoint missions in VTOL mode
+3. Runs waypoint missions for area surveillance
 4. Supports KML file import for mission planning
 5. Performs real-time human detection using YOLOv8 ONNX model
 
-VTOL Configuration:
-    - 4 lift motors (quad configuration for vertical flight)
-    - 1 pusher motor (forward thrust)
-    - Servo-controlled rudder/elevons
-    - Pixhawk with fmuv2 QuadPlane firmware
+Quadcopter Configuration:
+    - 4 motors (X or + configuration)
+    - RadioLink Pix6 flight controller
+    - ArduCopter firmware
 
 Commands received from ground station (tx_commands.py):
     PING              - Test connection
@@ -22,22 +21,22 @@ Commands received from ground station (tx_commands.py):
     ARM               - Arm the drone
     FORCEARM          - Force arm (bypass pre-arm checks)
     DISARM            - Disarm the drone
-    TAKEOFF:5         - Takeoff to 5 meters (VTOL vertical)
-    LAND              - Land immediately (QLAND - vertical landing)
-    RTL               - Return to launch (QRTL - vertical RTL)
-    ABORT             - Emergency abort (QLAND)
+    TAKEOFF:5         - Takeoff to 5 meters
+    LAND              - Land immediately
+    RTL               - Return to launch
+    ABORT             - Emergency abort (LAND)
     MISSION:START     - Start the autonomous mission
     MISSION:STOP      - Stop current mission
-    MODE:xxx          - Change flight mode (supports VTOL modes)
+    MODE:xxx          - Change flight mode
     LOAD:filename     - Load KML mission file
     
-    VTOL-Specific Modes:
-    MODE:QLOITER      - VTOL hover/loiter
-    MODE:QHOVER       - VTOL hover
-    MODE:QLAND        - VTOL vertical landing
-    MODE:QRTL         - VTOL return to launch
-    MODE:FBWA         - Fixed-wing fly-by-wire A
-    MODE:CRUISE       - Fixed-wing cruise
+    ArduCopter Flight Modes:
+    MODE:LOITER       - GPS hold position
+    MODE:GUIDED       - Autonomous waypoint navigation
+    MODE:AUTO         - Autonomous mission mode
+    MODE:RTL          - Return to launch
+    MODE:LAND         - Land at current position
+    MODE:STABILIZE    - Manual flight with auto-level
     
     Human Detection Commands:
     DETECT:START      - Start human detection camera
@@ -124,10 +123,9 @@ except ImportError as e:
 # Global constants - change these values to modify drone behavior
 SCOUT_ALTITUDE = 5.0  # Default altitude for all scouting missions (meters AGL)
 
-# VTOL Configuration - This code is designed for QuadPlane VTOL aircraft
-# Uses QLAND/QRTL for vertical landing/RTL instead of fixed-wing LAND/RTL
-IS_VTOL = True  # Set to True for QuadPlane VTOL, False for standard quadcopter
-VTOL_TRANSITION_ALTITUDE = 15.0  # Minimum altitude for fixed-wing transition (meters)
+# Quadcopter Configuration - This code is designed for ArduCopter quadcopter
+# Uses standard LAND/RTL modes for landing and return to launch
+IS_VTOL = False  # Set to False for standard quadcopter (RadioLink Pix6 + ArduCopter)
 
 
 class MainController:

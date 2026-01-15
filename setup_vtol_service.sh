@@ -1,10 +1,11 @@
 #!/bin/bash
 #
-# Setup script for LoRa VTOL autonomous service
+# Setup script for LoRa Quadcopter Scout Drone autonomous service
 # Run with: sudo bash setup_vtol_service.sh
 #
 # This configures the systemd service to auto-start
-# the VTOL controller on boot, listening for LoRa commands.
+# the scout drone controller on boot, listening for LoRa commands.
+# Hardware: RadioLink Pix6 + ArduCopter firmware
 #
 
 set -e
@@ -17,7 +18,7 @@ USER_NAME="dart2"
 GROUP_NAME="dart2"
 
 echo "========================================"
-echo "LoRa VTOL Service Setup"
+echo "LoRa Quadcopter Scout Service Setup"
 echo "========================================"
 echo "Working Dir: ${WORKING_DIR}"
 echo "User: ${USER_NAME}"
@@ -45,7 +46,7 @@ echo "[1/5] Creating systemd service file..."
 
 cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=LoRa VTOL Autonomous Controller
+Description=LoRa Quadcopter Scout Drone Controller
 After=multi-user.target
 After=network.target
 Wants=network.target
@@ -82,9 +83,11 @@ echo "    Created: /etc/systemd/system/${SERVICE_NAME}.service"
 echo "[2/5] Setting up udev rules for consistent serial device names..."
 
 cat > /etc/udev/rules.d/99-vtol-serial.rules << EOF
-# VTOL Serial Device Rules
-# Pixhawk USB connection (typically shows as ttyACM0)
+# Quadcopter Scout Drone Serial Device Rules
+# RadioLink Pix6 USB connection (typically shows as ttyACM0)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="26ac", ATTRS{idProduct}=="0011", SYMLINK+="ttyPixhawk", MODE="0666"
+# RadioLink Pix6 alternate USB IDs
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2dae", ATTRS{idProduct}=="1011", SYMLINK+="ttyPixhawk", MODE="0666"
 
 # 3DR/LoRa Radio (Silicon Labs CP210x or FTDI)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="ttyRadio", MODE="0666"
@@ -130,8 +133,8 @@ echo "========================================"
 echo "Hardware Check:"
 echo "========================================"
 echo "Expected devices:"
-echo "  Pixhawk:    /dev/ttyACM0 (or /dev/ttyPixhawk after replug)"
-echo "  LoRa Radio: /dev/ttyUSB0 (or /dev/ttyRadio after replug)"
+echo "  RadioLink Pix6: /dev/ttyACM0 (or /dev/ttyPixhawk after replug)"
+echo "  LoRa Radio:     /dev/ttyUSB0 (or /dev/ttyRadio after replug)"
 echo ""
 ls -la /dev/tty{ACM,USB}* 2>/dev/null || echo "  No USB serial devices found yet"
 echo ""
