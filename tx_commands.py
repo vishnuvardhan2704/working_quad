@@ -31,6 +31,8 @@ Commands:
     4             - LAND
     X             - ABORT (emergency)
     S15           - Set scout altitude to 15m (altitude required)
+    MGC           - MANUAL RELEASE Clockwise (stepper 180° CW)
+    MGA           - MANUAL RELEASE Anti-clockwise (stepper 180° CCW)
     
 Usage:
     python3 tx_commands.py
@@ -270,6 +272,12 @@ Commands:
   DETECT:STOP      - Stop detection
   DETECT:STATUS    - Get detection count + recording status
   DETECT:CONF:0.7  - Set confidence (0.1-1.0)
+  
+  === EMERGENCY DELIVERY ===
+  MGC              - MANUAL RELEASE Clockwise (stepper 180° CW)
+  MGA              - MANUAL RELEASE Anti-clockwise (stepper 180° CCW)
+                     High-priority, bypasses queue!
+                     Press multiple times for multiple releases
   
   === OTHER ===
   STATUS           - Get drone status

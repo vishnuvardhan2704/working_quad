@@ -53,10 +53,19 @@ import time
 import argparse
 import serial
 import threading
+import queue
 import math
 from datetime import datetime
 from collections import deque
 import numpy as np
+
+# Try to import GPIO for stepper motor control (MG command)
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("[WARN] RPi.GPIO not available - MG (manual release) command disabled")
 
 # Add current directory to path for imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -348,6 +357,20 @@ class MainController:
         # Precision delivery system (visual servo)
         self.delivery_handler = None
         
+        # MG (Manual Release) command - high priority queue
+        # This runs on a separate thread to bypass normal command queue
+        self.mg_queue = queue.Queue()
+        self.mg_thread = None
+        self.stepper_initialized = False
+        
+        # Stepper motor configuration (from test_stepper_motor.py)
+        self.STEP_PIN = 18
+        self.DIR_PIN = 23
+        self.ENABLE_PIN = 24
+        self.MICROSTEP_MODE = 1   # 1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth
+        self.STEPS_PER_REV = 200 * self.MICROSTEP_MODE  # 200 steps for full step mode
+        self.STEP_DELAY = 0.05  # 50ms delay between steps
+        
         # Video recording
         self.video_writer = None
         self.recording = False
@@ -376,6 +399,149 @@ class MainController:
                 MissionLogger.header(msg)
         else:
             print(f"[{timestamp}] [{level.upper()}] {msg}")
+    
+    # ============================================
+    # STEPPER MOTOR CONTROL (MG Command)
+    # ============================================
+    
+    def init_stepper_motor(self):
+        """Initialize stepper motor GPIO pins."""
+        if not GPIO_AVAILABLE:
+            self.log("warning", "GPIO not available - MG command disabled")
+            return False
+        
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            
+            # Configure pins as outputs
+            GPIO.setup(self.STEP_PIN, GPIO.OUT)
+            GPIO.setup(self.DIR_PIN, GPIO.OUT)
+            GPIO.setup(self.ENABLE_PIN, GPIO.OUT)
+            
+            # Initialize states (motor disabled)
+            GPIO.output(self.STEP_PIN, GPIO.LOW)
+            GPIO.output(self.DIR_PIN, GPIO.LOW)
+            GPIO.output(self.ENABLE_PIN, GPIO.HIGH)  # Disabled (active LOW)
+            
+            self.stepper_initialized = True
+            self.log("success", "Stepper motor GPIO initialized (MG command ready)")
+            self.log("info", f"     STEP: GPIO {self.STEP_PIN}, DIR: GPIO {self.DIR_PIN}, EN: GPIO {self.ENABLE_PIN}")
+            return True
+            
+        except Exception as e:
+            self.log("error", f"Stepper GPIO init failed: {e}")
+            self.stepper_initialized = False
+            return False
+    
+    def stepper_enable(self):
+        """Enable the motor driver."""
+        if not self.stepper_initialized:
+            return False
+        GPIO.output(self.ENABLE_PIN, GPIO.LOW)  # Active LOW
+        time.sleep(0.01)
+        return True
+    
+    def stepper_disable(self):
+        """Disable the motor driver."""
+        if not self.stepper_initialized:
+            return
+        GPIO.output(self.ENABLE_PIN, GPIO.HIGH)
+    
+    def stepper_rotate_180(self, clockwise=True):
+        """Rotate stepper motor 180 degrees in specified direction."""
+        if not self.stepper_initialized:
+            self.log("error", "Stepper not initialized")
+            return False
+        
+        # Calculate steps for 180 degrees
+        total_steps = int((180.0 / 360.0) * self.STEPS_PER_REV)
+        direction = "CW" if clockwise else "CCW"
+        
+        self.log("state", f"[MG] MANUAL RELEASE - 180° {direction} ({total_steps} steps)")
+        
+        # Enable motor
+        self.stepper_enable()
+        
+        # Set direction
+        GPIO.output(self.DIR_PIN, GPIO.HIGH if clockwise else GPIO.LOW)
+        time.sleep(0.001)
+        
+        # Execute steps
+        for i in range(total_steps):
+            GPIO.output(self.STEP_PIN, GPIO.HIGH)
+            time.sleep(self.STEP_DELAY / 2)
+            GPIO.output(self.STEP_PIN, GPIO.LOW)
+            time.sleep(self.STEP_DELAY / 2)
+        
+        # Disable motor
+        self.stepper_disable()
+        
+        self.log("success", f"[MG] Release complete - 180° {direction}")
+        return True
+    
+    def mg_command_worker(self):
+        """
+        High-priority worker thread for MGC/MGA (Manual Release) commands.
+        Runs independently of main command queue for immediate response.
+        MGC = 180° Clockwise, MGA = 180° Anti-clockwise
+        """
+        self.log("info", "[MG] Manual release thread started (high priority)")
+        
+        while self.running:
+            try:
+                # Wait for MG command with timeout (so we can check self.running)
+                try:
+                    cmd = self.mg_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                
+                if cmd == "MGC":
+                    # Execute immediately - 180° Clockwise
+                    self.log("warning", "[MGC] *** EMERGENCY MANUAL RELEASE - CLOCKWISE ***")
+                    self.send_response("MGC: MANUAL RELEASE TRIGGERED (CW)!")
+                    
+                    if self.stepper_initialized:
+                        success = self.stepper_rotate_180(clockwise=True)
+                        if success:
+                            self.send_response("MGC: Release complete (180° CW)")
+                        else:
+                            self.send_response("MGC: Release FAILED")
+                    else:
+                        self.send_response("MGC: ERROR - Stepper not initialized")
+                        self.log("error", "[MGC] Stepper motor not initialized!")
+                
+                elif cmd == "MGA":
+                    # Execute immediately - 180° Anti-clockwise
+                    self.log("warning", "[MGA] *** EMERGENCY MANUAL RELEASE - ANTI-CLOCKWISE ***")
+                    self.send_response("MGA: MANUAL RELEASE TRIGGERED (CCW)!")
+                    
+                    if self.stepper_initialized:
+                        success = self.stepper_rotate_180(clockwise=False)
+                        if success:
+                            self.send_response("MGA: Release complete (180° CCW)")
+                        else:
+                            self.send_response("MGA: Release FAILED")
+                    else:
+                        self.send_response("MGA: ERROR - Stepper not initialized")
+                        self.log("error", "[MGA] Stepper motor not initialized!")
+                
+                self.mg_queue.task_done()
+                
+            except Exception as e:
+                self.log("error", f"[MG] Worker error: {e}")
+        
+        self.log("info", "[MG] Manual release thread stopped")
+    
+    def cleanup_stepper(self):
+        """Clean up stepper motor GPIO."""
+        if GPIO_AVAILABLE and self.stepper_initialized:
+            try:
+                self.stepper_disable()
+                GPIO.cleanup([self.STEP_PIN, self.DIR_PIN, self.ENABLE_PIN])
+                self.log("info", "Stepper GPIO cleaned up")
+            except Exception as e:
+                self.log("warning", f"Stepper cleanup error: {e}")
     
     def connect_pixhawk(self):
         """Connect to Pixhawk."""
@@ -495,6 +661,23 @@ class MainController:
         cmd_original = cmd.strip()  # Keep original case for base64 data
         cmd = cmd_original.upper()  # Uppercase for command matching
         self.log("state", f"[RX] Command: {cmd[:50]}...")  # Truncate long commands
+        
+        # ============================================
+        # MGC/MGA COMMANDS - HIGH PRIORITY (bypasses queue)
+        # Emergency manual release - stepper motor 180°
+        # MGC = Clockwise, MGA = Anti-clockwise
+        # ============================================
+        if cmd == "MGC":
+            # Put in high-priority queue - processed by dedicated thread
+            self.mg_queue.put("MGC")
+            self.log("warning", "[MGC] Emergency release CW queued (high priority)")
+            return  # Don't process through normal queue
+        
+        if cmd == "MGA":
+            # Put in high-priority queue - processed by dedicated thread
+            self.mg_queue.put("MGA")
+            self.log("warning", "[MGA] Emergency release CCW queued (high priority)")
+            return  # Don't process through normal queue
         
         if not self.vehicle:
             self.send_response("ERROR: No vehicle connected")
@@ -2486,6 +2669,16 @@ class MainController:
         
         self.running = True
         
+        # Initialize stepper motor for MG (Manual Release) command
+        if GPIO_AVAILABLE:
+            self.init_stepper_motor()
+            # Start MG command worker thread (high priority, separate from main queue)
+            self.mg_thread = threading.Thread(target=self.mg_command_worker, daemon=True)
+            self.mg_thread.start()
+            self.log("success", "MG (Manual Release) command ready - HIGH PRIORITY")
+        else:
+            self.log("warning", "MG command disabled (GPIO not available)")
+        
         try:
             if radio_connected:
                 self.listen_loop()
@@ -2509,6 +2702,9 @@ class MainController:
                     self.detection_thread.join(timeout=2.0)
                 if self.camera:
                     self.camera.release()
+            
+            # Cleanup stepper motor GPIO
+            self.cleanup_stepper()
             
             # Stop telemetry
             if self.telemetry_enabled:

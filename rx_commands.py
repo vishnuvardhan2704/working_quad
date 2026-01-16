@@ -36,6 +36,8 @@ Commands Supported:
     
     === EMERGENCY ===
     ABORT         - Emergency abort (immediate land)
+    MG            - MANUAL RELEASE (stepper 180° CW) - HIGH PRIORITY
+                    Bypasses command queue! Press multiple times for multiple releases.
     
     === LEGACY (deprecated) ===
     SCOUT         - [DEPRECATED] Use KML transmission protocol instead
@@ -60,8 +62,17 @@ import time
 import argparse
 import serial
 import threading
+import queue
 from datetime import datetime
 import math  # For coordinate calculations
+
+# Try to import GPIO for stepper motor control (MG command)
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("[WARN] RPi.GPIO not available - MG (manual release) command disabled")
 
 # Add nidar/ to path for importing modules
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +134,20 @@ class DroneCommandReceiver:
         # Telemetry logging
         self.telemetry_log_file = None
         self.setup_telemetry_logging()
+        
+        # MG (Manual Release) command - high priority queue
+        # This runs on a separate thread to bypass normal command queue
+        self.mg_queue = queue.Queue()
+        self.mg_thread = None
+        self.stepper_initialized = False
+        
+        # Stepper motor configuration (from test_stepper_motor.py)
+        self.STEP_PIN = 18
+        self.DIR_PIN = 23
+        self.ENABLE_PIN = 24
+        self.MICROSTEP_MODE = 1   # 1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth
+        self.STEPS_PER_REV = 200 * self.MICROSTEP_MODE  # 200 steps for full step mode
+        self.STEP_DELAY = 0.05  # 50ms delay between steps
     
     def setup_telemetry_logging(self):
         """Setup telemetry log file."""
@@ -144,6 +169,132 @@ class DroneCommandReceiver:
         except Exception as e:
             print(f"[WARN] Could not setup telemetry logging: {e}")
             self.telemetry_log_file = None
+    
+    # ============================================
+    # STEPPER MOTOR CONTROL (MG Command)
+    # ============================================
+    
+    def init_stepper_motor(self):
+        """Initialize stepper motor GPIO pins."""
+        if not GPIO_AVAILABLE:
+            self.log("warning", "GPIO not available - MG command disabled")
+            return False
+        
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            
+            # Configure pins as outputs
+            GPIO.setup(self.STEP_PIN, GPIO.OUT)
+            GPIO.setup(self.DIR_PIN, GPIO.OUT)
+            GPIO.setup(self.ENABLE_PIN, GPIO.OUT)
+            
+            # Initialize states (motor disabled)
+            GPIO.output(self.STEP_PIN, GPIO.LOW)
+            GPIO.output(self.DIR_PIN, GPIO.LOW)
+            GPIO.output(self.ENABLE_PIN, GPIO.HIGH)  # Disabled (active LOW)
+            
+            self.stepper_initialized = True
+            self.log("success", "Stepper motor GPIO initialized")
+            self.log("info", f"     STEP: GPIO {self.STEP_PIN}, DIR: GPIO {self.DIR_PIN}, EN: GPIO {self.ENABLE_PIN}")
+            return True
+            
+        except Exception as e:
+            self.log("error", f"Stepper GPIO init failed: {e}")
+            self.stepper_initialized = False
+            return False
+    
+    def stepper_enable(self):
+        """Enable the motor driver."""
+        if not self.stepper_initialized:
+            return False
+        GPIO.output(self.ENABLE_PIN, GPIO.LOW)  # Active LOW
+        time.sleep(0.01)
+        return True
+    
+    def stepper_disable(self):
+        """Disable the motor driver."""
+        if not self.stepper_initialized:
+            return
+        GPIO.output(self.ENABLE_PIN, GPIO.HIGH)
+    
+    def stepper_rotate_180_cw(self):
+        """Rotate stepper motor 180 degrees clockwise (package release)."""
+        if not self.stepper_initialized:
+            self.log("error", "Stepper not initialized")
+            return False
+        
+        # Calculate steps for 180 degrees
+        total_steps = int((180.0 / 360.0) * self.STEPS_PER_REV)
+        
+        self.log("state", f"[MG] MANUAL RELEASE - 180° CW ({total_steps} steps)")
+        
+        # Enable motor
+        self.stepper_enable()
+        
+        # Set direction clockwise
+        GPIO.output(self.DIR_PIN, GPIO.HIGH)
+        time.sleep(0.001)
+        
+        # Execute steps
+        for i in range(total_steps):
+            GPIO.output(self.STEP_PIN, GPIO.HIGH)
+            time.sleep(self.STEP_DELAY / 2)
+            GPIO.output(self.STEP_PIN, GPIO.LOW)
+            time.sleep(self.STEP_DELAY / 2)
+        
+        # Disable motor
+        self.stepper_disable()
+        
+        self.log("success", "[MG] Release complete - 180° CW")
+        return True
+    
+    def mg_command_worker(self):
+        """
+        High-priority worker thread for MG (Manual Release) commands.
+        Runs independently of main command queue for immediate response.
+        """
+        self.log("info", "[MG] Manual release thread started (high priority)")
+        
+        while self.running:
+            try:
+                # Wait for MG command with timeout (so we can check self.running)
+                try:
+                    cmd = self.mg_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                
+                if cmd == "MG":
+                    # Execute immediately - no queue, no waiting
+                    self.log("warning", "[MG] *** EMERGENCY MANUAL RELEASE ***")
+                    self.send_response("MG: MANUAL RELEASE TRIGGERED!")
+                    
+                    if self.stepper_initialized:
+                        success = self.stepper_rotate_180_cw()
+                        if success:
+                            self.send_response("MG: Release complete (180° CW)")
+                        else:
+                            self.send_response("MG: Release FAILED")
+                    else:
+                        self.send_response("MG: ERROR - Stepper not initialized")
+                        self.log("error", "[MG] Stepper motor not initialized!")
+                
+                self.mg_queue.task_done()
+                
+            except Exception as e:
+                self.log("error", f"[MG] Worker error: {e}")
+        
+        self.log("info", "[MG] Manual release thread stopped")
+    
+    def cleanup_stepper(self):
+        """Clean up stepper motor GPIO."""
+        if GPIO_AVAILABLE and self.stepper_initialized:
+            try:
+                self.stepper_disable()
+                GPIO.cleanup([self.STEP_PIN, self.DIR_PIN, self.ENABLE_PIN])
+                self.log("info", "Stepper GPIO cleaned up")
+            except Exception as e:
+                self.log("warning", f"Stepper cleanup error: {e}")
     
     def log_telemetry_to_file(self, mode, armed, alt, voltage, current, level, gps_fix, sats, hdop, gx, gy, gz, vx, vy, vz, rssi):
         """Log telemetry data to CSV-style file."""
@@ -309,6 +460,16 @@ class DroneCommandReceiver:
         cmd = cmd_original.upper()  # Uppercase for command matching
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log("state", f"[RX] Command: {cmd[:50]}...")  # Truncate long commands in log
+        
+        # ============================================
+        # MG COMMAND - HIGH PRIORITY (bypasses queue)
+        # Emergency manual release - stepper motor 180° CW
+        # ============================================
+        if cmd == "MG":
+            # Put in high-priority queue - processed by dedicated thread
+            self.mg_queue.put("MG")
+            self.log("warning", "[MG] Emergency release queued (high priority)")
+            return  # Don't process through normal queue
         
         if not self.vehicle:
             self.send_response("ERROR: No vehicle connected")
@@ -901,6 +1062,16 @@ class DroneCommandReceiver:
         
         self.running = True
         
+        # Initialize stepper motor for MG (Manual Release) command
+        if GPIO_AVAILABLE:
+            self.init_stepper_motor()
+            # Start MG command worker thread (high priority, separate from main queue)
+            self.mg_thread = threading.Thread(target=self.mg_command_worker, daemon=True)
+            self.mg_thread.start()
+            self.log("success", "MG (Manual Release) command ready - HIGH PRIORITY")
+        else:
+            self.log("warning", "MG command disabled (GPIO not available)")
+        
         # Start telemetry streaming thread
         self.telemetry_thread = threading.Thread(target=self.telemetry_loop, daemon=True)
         self.telemetry_thread.start()
@@ -922,6 +1093,8 @@ class DroneCommandReceiver:
             self.listen_loop()
         finally:
             self.running = False
+            # Cleanup stepper motor GPIO
+            self.cleanup_stepper()
             if self.vehicle:
                 self.vehicle.close()
             if self.radio:

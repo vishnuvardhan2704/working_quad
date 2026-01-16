@@ -97,8 +97,9 @@ class StepperMotorController:
     # NEMA 17 = 200 steps/revolution (1.8° per step) in full-step mode
     MICROSTEP_MODE = 1       # 1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth
     STEPS_PER_REV = 200 * MICROSTEP_MODE  # 200 steps for full step mode
-    RELEASE_DEGREES = 180    # Degrees to rotate for package release (half rotation)
-    STEP_DELAY = 0.003       # 3ms delay between steps (matched to working test code)
+    RELEASE_DEGREES = 180    # Degrees to rotate for each push/pull motion
+    STEP_DELAY = 0.003       # 3ms delay between steps (fast for oscillation)
+    RELEASE_DURATION = 10.0  # Total duration of release oscillation in seconds
     
     def __init__(self, logger=None, init_gpio=False):
         """
@@ -233,40 +234,50 @@ class StepperMotorController:
     def release_package(self):
         """
         Execute package release sequence.
-        Rotates motor to open delivery mechanism and release package.
+        Oscillates motor CW 180° then CCW 180° repeatedly for RELEASE_DURATION seconds
+        to push the payload out.
         
         Returns:
             bool: True if package release executed successfully
         """
-        self.log("[DELIVERY] Releasing package...")
+        self.log("[DELIVERY] Releasing package - oscillating for 10 seconds...")
         
         # Enable motor (this also sets up GPIO on first use)
         if not self.enable_motor():
             self.log("[WARN] Motor not available - simulating package release")
-            time.sleep(1.0)  # Simulate release time
+            time.sleep(self.RELEASE_DURATION)  # Simulate release time
             return False
         
-        # Set direction (clockwise to release)
-        self.set_direction(clockwise=True)
-        
-        # Execute release rotation (180 degrees = half rotation)
         total_steps = int((self.RELEASE_DEGREES / 360.0) * self.STEPS_PER_REV)
-        self.log(f"[DELIVERY] Rotating {self.RELEASE_DEGREES}° ({total_steps} steps) to release...")
+        start_time = time.time()
+        cycle_count = 0
         
-        success = self.step(total_steps)
-        
-        # Brief pause
-        time.sleep(0.5)
+        # Oscillate for RELEASE_DURATION seconds
+        while (time.time() - start_time) < self.RELEASE_DURATION:
+            cycle_count += 1
+            elapsed = time.time() - start_time
+            self.log(f"[DELIVERY] Cycle {cycle_count} - Push CW 180° (elapsed: {elapsed:.1f}s)")
+            
+            # Push CW 180°
+            self.set_direction(clockwise=True)
+            self.step(total_steps)
+            
+            # Check if time is up
+            if (time.time() - start_time) >= self.RELEASE_DURATION:
+                break
+            
+            # Pull back CCW 180°
+            self.log(f"[DELIVERY] Cycle {cycle_count} - Retract CCW 180°")
+            self.set_direction(clockwise=False)
+            self.step(total_steps)
         
         # Disable motor
         self.disable_motor()
         
-        if success:
-            self.log("[DELIVERY] Package released successfully!")
-        else:
-            self.log("[ERROR] Package release failed")
+        total_time = time.time() - start_time
+        self.log(f"[DELIVERY] Package released! {cycle_count} cycles in {total_time:.1f}s")
         
-        return success
+        return True
     
     def rotate_degrees(self, degrees, clockwise=True):
         """
@@ -360,7 +371,7 @@ class VisualServoController:
     POSITION_GAIN = 0.003    # Proportional gain for pixel-to-velocity
     
     # Timing
-    HOVER_TIME = 5.0         # Seconds to hover for delivery
+    HOVER_TIME = 40.0        # Seconds to hover for delivery
     CENTERING_TIMEOUT = 60   # Max seconds to attempt centering
     DETECTION_TIMEOUT = 30   # Max seconds to wait for human detection
     

@@ -49,9 +49,9 @@ class StepperMotorTest:
     # NEMA 17 = 200 steps/revolution (1.8° per step) in full-step mode
     # With 1/2 microstepping (common driver default): 400 steps/rev
     # Adjust MICROSTEP_MODE based on your driver's MS1/MS2/MS3 configuration
-    MICROSTEP_MODE = 1    # 1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth
-    STEPS_PER_REV = 200 * MICROSTEP_MODE  # 800 steps for 1/4 microstepping
-    STEP_DELAY = 0.003  # 1ms delay between steps (faster for microstepping)
+    MICROSTEP_MODE = 1   # 1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth
+    STEPS_PER_REV = 200 * MICROSTEP_MODE  # 200 steps for full step mode
+    STEP_DELAY = 0.05  # 50ms delay between steps (fast for oscillation)
     
     def __init__(self):
         """Initialize the stepper motor test."""
